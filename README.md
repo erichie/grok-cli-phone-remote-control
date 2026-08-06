@@ -108,10 +108,12 @@ Avoid exposing port `8787` to the public internet without additional protection.
 - Chat with the local agent (tools, skills, MCP as configured for Grok on that machine)
 - Photo attach (library / camera) → saved under `~/.grok/phone-inbox/`
 - Durable jobs under `~/.grok/phone-jobs/` (phone may lock; work continues on the host)
+- **Live reply push** via Server-Sent Events (`GET /api/jobs/:id/stream`) so finished answers hit the phone immediately (polling is only a backup). WebRTC is unnecessary for this; SSE is the simple phone↔host push channel.
 - **Reset** button: cancel queue + restart agent session
 - Instant `/usage` (billing API via host Grok login — not a tool loop)
 - Slash catalog for common CLI / tool shortcuts
 - Markdown replies; generated Imagine images served inline when available
+- Auto-recovery: hung agent turns fall back to a one-shot `grok -p` so a final message still arrives
 
 ---
 

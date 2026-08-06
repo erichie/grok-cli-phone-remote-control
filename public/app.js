@@ -36,11 +36,12 @@ let history = [];
 let toolsCatalog = [];
 let slashActiveIndex = 0;
 
-/** Active job polls: jobId → { bodyEl, toolsEl, timer } */
+/** Active job watchers: jobId → { bodyEl, thinkingEl, timer, es, closed } */
 const activePolls = new Map();
-const POLL_MS = 1200;
+/** Backup poll while SSE is live (SSE is primary). */
+const POLL_MS = 2500;
 /** Extra confirmation polls after terminal status (race: status flips before reply flush). */
-const TERMINAL_CONFIRM_POLLS = 3;
+const TERMINAL_CONFIRM_POLLS = 2;
 
 function getSecret() {
   return localStorage.getItem("phone_chat_secret") || "";
@@ -388,14 +389,19 @@ function renderHistory() {
 }
 
 /**
- * Poll server job until done. Safe across phone lock (Mac keeps working).
- * Always applies the latest reply text so partial→final updates never get stuck.
+ * Watch a job until done.
+ * Primary: Server-Sent Events push (`/api/jobs/:id/stream`) so final replies
+ * arrive the moment the Mac finishes — no waiting for the next poll tick.
+ * Backup: light polling (SSE can drop when iOS suspends the page).
  */
 function startJobPoll(jobId, bodyEl, thinkingEl) {
   if (activePolls.has(jobId)) return;
 
   let terminalConfirms = 0;
   let lastReplyLen = -1;
+  let closed = false;
+  /** @type {EventSource | null} */
+  let es = null;
 
   const applyJobToUi = (job) => {
     const toolsLine = job.tools?.length
@@ -420,9 +426,85 @@ function startJobPoll(jobId, bodyEl, thinkingEl) {
     return { toolsLine, imageUrls, reply };
   };
 
+  const finishWithJob = (job) => {
+    if (closed) return;
+    applyJobToUi(job);
+    setThinking(thinkingEl, { hide: true });
+    if (!(job.reply || "").trim() && !job.error) {
+      setBodyContent(
+        bodyEl,
+        "_(No reply text received. Tap Reset and send again.)_",
+        "bot"
+      );
+    }
+    stopJobPoll(jobId);
+    setConn("connected", "ok");
+    scrollBottom();
+  };
+
+  const handleJobSnapshot = (job) => {
+    if (closed || !job) return;
+    const reallyQueued =
+      job.status === "queued" && (job.queuePosition || 0) > 0;
+    const { toolsLine, reply } = applyJobToUi(job);
+
+    if (
+      job.status === "done" ||
+      job.status === "error" ||
+      job.status === "cancelled"
+    ) {
+      const replyLen = (reply || "").length;
+      const grew = replyLen > lastReplyLen;
+      lastReplyLen = replyLen;
+      // One extra tick if empty/grew, then commit (SSE already has final state)
+      if (terminalConfirms < TERMINAL_CONFIRM_POLLS && (grew || !reply)) {
+        terminalConfirms += 1;
+        setThinking(thinkingEl, {
+          phase: reply ? "Finishing…" : "Almost done…",
+        });
+        setConn("connected", "ok");
+        scrollBottom();
+        // SSE end event or next poll will finalize
+        if (job.status === "done" || job.status === "error") {
+          // Prefer immediate finish when we already have a non-empty reply
+          if (reply && replyLen > 0 && !grew) {
+            finishWithJob(job);
+          }
+        }
+        return;
+      }
+      finishWithJob(job);
+      return;
+    }
+
+    terminalConfirms = 0;
+    lastReplyLen = (reply || "").length;
+
+    const updatedMs = Date.parse(job.updatedAt || job.startedAt || 0) || 0;
+    const staleSec = updatedMs
+      ? Math.floor((Date.now() - updatedMs) / 1000)
+      : 0;
+    const stale =
+      !reallyQueued && job.status === "running" && staleSec > 120;
+    const phase = reallyQueued
+      ? `Queued (#${job.queuePosition})`
+      : stale
+        ? `Still working… (${Math.floor(staleSec / 60)}m)`
+        : job.tools?.length
+          ? "Working…"
+          : "Thinking…";
+    setThinking(thinkingEl, {
+      phase,
+      tools: toolsLine,
+      thought: job.thought || "",
+    });
+    setConn("connected", "ok");
+    scrollBottom();
+  };
+
   const tick = async () => {
     const secret = getSecret();
-    if (!secret) return;
+    if (!secret || closed) return;
     try {
       const res = await fetch(`/api/jobs/${jobId}`, {
         headers: { Authorization: `Bearer ${secret}` },
@@ -439,81 +521,69 @@ function startJobPoll(jobId, bodyEl, thinkingEl) {
         return;
       }
       if (!res.ok) return;
-      const job = await res.json();
-      const reallyQueued =
-        job.status === "queued" && (job.queuePosition || 0) > 0;
-      const { toolsLine, reply } = applyJobToUi(job);
-
-      if (job.status === "done" || job.status === "error") {
-        // Confirm a couple times so we never freeze on a partial flush race
-        const replyLen = (reply || "").length;
-        const grew = replyLen > lastReplyLen;
-        lastReplyLen = replyLen;
-        if (
-          terminalConfirms < TERMINAL_CONFIRM_POLLS &&
-          (grew || !reply)
-        ) {
-          terminalConfirms += 1;
-          setThinking(thinkingEl, {
-            phase: reply ? "Finishing…" : "Almost done…",
-          });
-          setConn("connected", "ok");
-          scrollBottom();
-          return;
-        }
-        setThinking(thinkingEl, { hide: true });
-        // Final paint
-        applyJobToUi(job);
-        if (!reply && !job.error) {
-          setBodyContent(
-            bodyEl,
-            "_(No reply text received. Tap Reset and send again.)_",
-            "bot"
-          );
-        }
-        stopJobPoll(jobId);
-        setConn("connected", "ok");
-        scrollBottom();
-        return;
-      }
-
-      terminalConfirms = 0;
-      lastReplyLen = (reply || "").length;
-
-      // In progress
-      const updatedMs = Date.parse(job.updatedAt || job.startedAt || 0) || 0;
-      const staleSec = updatedMs
-        ? Math.floor((Date.now() - updatedMs) / 1000)
-        : 0;
-      const stale =
-        !reallyQueued && job.status === "running" && staleSec > 120;
-      const phase = reallyQueued
-        ? `Queued (#${job.queuePosition})`
-        : stale
-          ? `Still working… (${Math.floor(staleSec / 60)}m)`
-          : job.tools?.length
-            ? "Working…"
-            : "Thinking…";
-      setThinking(thinkingEl, {
-        phase,
-        tools: toolsLine,
-        thought: job.thought || "",
-      });
-      setConn("connected", "ok");
-      scrollBottom();
+      handleJobSnapshot(await res.json());
     } catch {
-      // network blip / phone asleep — keep polling
+      // network blip / phone asleep — keep polling / SSE will reconnect on focus
     }
   };
 
+  // —— SSE primary path (push) ——
+  try {
+    const secret = getSecret();
+    if (secret && typeof EventSource !== "undefined") {
+      const url = `/api/jobs/${encodeURIComponent(jobId)}/stream?token=${encodeURIComponent(secret)}`;
+      es = new EventSource(url);
+      es.addEventListener("job", (ev) => {
+        try {
+          handleJobSnapshot(JSON.parse(ev.data));
+        } catch {
+          /* ignore bad frame */
+        }
+      });
+      es.addEventListener("end", (ev) => {
+        try {
+          const job = JSON.parse(ev.data);
+          // Force terminal UI immediately on SSE end
+          terminalConfirms = TERMINAL_CONFIRM_POLLS;
+          handleJobSnapshot(job);
+          finishWithJob(job);
+        } catch {
+          void tick();
+        }
+      });
+      es.onerror = () => {
+        // iOS often closes SSE when backgrounded; poll continues
+        try {
+          es.close();
+        } catch {
+          /* ignore */
+        }
+        es = null;
+        const w = activePolls.get(jobId);
+        if (w) w.es = null;
+      };
+    }
+  } catch {
+    es = null;
+  }
+
   void tick();
   const timer = setInterval(() => void tick(), POLL_MS);
-  activePolls.set(jobId, { bodyEl, thinkingEl, timer });
+  activePolls.set(jobId, { bodyEl, thinkingEl, timer, es, closed: false });
 }
 
 function stopJobPoll(jobId) {
   const p = activePolls.get(jobId);
-  if (p) clearInterval(p.timer);
+  if (!p) return;
+  p.closed = true;
+  if (p.timer) clearInterval(p.timer);
+  if (p.es) {
+    try {
+      p.es.close();
+    } catch {
+      /* ignore */
+    }
+  }
   activePolls.delete(jobId);
 }
 

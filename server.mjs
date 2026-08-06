@@ -898,6 +898,51 @@ function isAllowedMediaPath(absPath) {
 
 /** Serialize disk writes per job so concurrent stream updates never corrupt JSON. */
 const persistChains = new Map();
+/** Live SSE subscribers: jobId → Set<ServerResponse> */
+const jobSubscribers = new Map();
+
+function notifyJobSubscribers(job) {
+  if (!job?.id) return;
+  const subs = jobSubscribers.get(job.id);
+  if (!subs || !subs.size) return;
+  let payload;
+  try {
+    payload = JSON.stringify(publicJob(job));
+  } catch (e) {
+    console.warn("[sse] serialize failed", e.message);
+    return;
+  }
+  const chunk = `event: job\ndata: ${payload}\n\n`;
+  const terminal =
+    job.status === "done" ||
+    job.status === "error" ||
+    job.status === "cancelled";
+  for (const res of [...subs]) {
+    try {
+      res.write(chunk);
+      if (terminal) {
+        res.write(`event: end\ndata: ${payload}\n\n`);
+        res.end();
+        subs.delete(res);
+      }
+    } catch {
+      subs.delete(res);
+    }
+  }
+  if (!subs.size) jobSubscribers.delete(job.id);
+}
+
+function subscribeJob(jobId, res) {
+  if (!jobSubscribers.has(jobId)) jobSubscribers.set(jobId, new Set());
+  jobSubscribers.get(jobId).add(res);
+  res.on("close", () => {
+    const s = jobSubscribers.get(jobId);
+    if (s) {
+      s.delete(res);
+      if (!s.size) jobSubscribers.delete(jobId);
+    }
+  });
+}
 
 async function persistJob(job) {
   if (!job?.id) return;
@@ -913,6 +958,8 @@ async function persistJob(job) {
       const tmp = dest + `.${process.pid}.${Date.now()}.tmp`;
       await writeFile(tmp, snapshot, "utf8");
       await rename(tmp, dest);
+      // Push live update to any phone SSE listeners
+      notifyJobSubscribers(jobs.get(id) || job);
     })
     .catch((e) => {
       console.warn("[jobs] persist failed", id, e.message);
@@ -1337,13 +1384,13 @@ async function runJob(job) {
       return;
     }
 
-    // Failed turn — retry transient agent deaths; don't retry hard idle with no tools
+    // Failed turn — retry agent only for process death / empty; idle hangs go straight to headless
     const canRetry =
       attempt < maxAttempts &&
+      !lastResult.idleTimedOut &&
       (isTransientAgentError(lastResult.error) ||
         lastResult.error === "incomplete partial ack" ||
-        lastResult.error === "empty reply" ||
-        (lastResult.timedOut && (job.tools || []).length > 0));
+        lastResult.error === "empty reply");
 
     if (!canRetry) break;
 
@@ -1351,7 +1398,7 @@ async function runJob(job) {
     await new Promise((r) => setTimeout(r, 800));
   }
 
-  // Agent path failed — last-resort headless one-shot so the phone ALWAYS gets an answer
+  // Agent path failed — headless one-shot so the phone ALWAYS gets a finished reply
   try {
     console.warn(
       `[jobs] ${job.id} falling back to headless -p after agent failure: ${lastResult.error}`
@@ -1362,6 +1409,7 @@ async function runJob(job) {
       status: "running",
       at: new Date().toISOString(),
     });
+    job.updatedAt = new Date().toISOString();
     await persistJob(job);
     const partial = (job.reply || "").trim();
     const fallbackPrompt = [
@@ -1377,7 +1425,7 @@ async function runJob(job) {
     const headlessReply = await runHeadlessPrompt(
       fallbackPrompt,
       CWD,
-      Math.min(JOB_MAX_TIMEOUT_MS, 10 * 60 * 1000)
+      Math.min(JOB_MAX_TIMEOUT_MS, 4 * 60 * 1000)
     );
     job.reply = headlessReply;
     job.status = "done";
@@ -1610,6 +1658,52 @@ async function handleJobGet(req, res, id) {
   const job = await loadJob(id);
   if (!job) return sendJson(res, 404, { error: "job not found" });
   sendJson(res, 200, publicJob(job));
+}
+
+/**
+ * GET /api/jobs/:id/stream — Server-Sent Events (push) for live job updates.
+ * Prefer this over polling: final replies arrive the moment the Mac finishes.
+ * Auth via Authorization header or ?token= (EventSource cannot set headers).
+ */
+async function handleJobStream(req, res, id) {
+  if (!authOk(req)) return sendJson(res, 401, { error: "unauthorized" });
+  const job = await loadJob(id);
+  if (!job) return sendJson(res, 404, { error: "job not found" });
+
+  res.writeHead(200, {
+    "Content-Type": "text/event-stream; charset=utf-8",
+    "Cache-Control": "no-cache, no-transform",
+    Connection: "keep-alive",
+    "Access-Control-Allow-Origin": "*",
+    "X-Accel-Buffering": "no",
+  });
+  if (typeof res.flushHeaders === "function") res.flushHeaders();
+
+  // Hello + current snapshot immediately
+  res.write(`event: hello\ndata: ${JSON.stringify({ jobId: id })}\n\n`);
+  res.write(`event: job\ndata: ${JSON.stringify(publicJob(job))}\n\n`);
+
+  if (
+    job.status === "done" ||
+    job.status === "error" ||
+    job.status === "cancelled"
+  ) {
+    res.write(`event: end\ndata: ${JSON.stringify(publicJob(job))}\n\n`);
+    res.end();
+    return;
+  }
+
+  subscribeJob(id, res);
+
+  // Heartbeat so mobile Safari / proxies don't drop the stream
+  const beat = setInterval(() => {
+    try {
+      res.write(`: ping ${Date.now()}\n\n`);
+    } catch {
+      clearInterval(beat);
+    }
+  }, 15000);
+  res.on("close", () => clearInterval(beat));
 }
 
 async function handleJobsList(req, res) {
@@ -2035,6 +2129,12 @@ const server = http.createServer(async (req, res) => {
     );
     if (req.method === "GET" && jobMedia) {
       return await handleJobMedia(req, res, jobMedia[1], jobMedia[2]);
+    }
+    const jobStream = pathOnly.match(
+      /^\/api\/jobs\/([a-f0-9-]+)\/stream$/i
+    );
+    if (req.method === "GET" && jobStream) {
+      return await handleJobStream(req, res, jobStream[1]);
     }
     const jobMatch = pathOnly.match(/^\/api\/jobs\/([a-f0-9-]+)$/i);
     if (req.method === "GET" && jobMatch) {
