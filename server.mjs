@@ -26,6 +26,15 @@ import { fileURLToPath } from "node:url";
 import { homedir, tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { createInterface } from "node:readline";
+import {
+  applySessionUpdate,
+  applyPromptDone,
+  forceTerminalizeJob,
+  isTerminalJobStatus,
+} from "./lib/job-stream.mjs";
+import { TerminalManager } from "./lib/terminal-manager.mjs";
+import { defaultAllowedRoots } from "./lib/fs-handlers.mjs";
+import { AcpLineHandler } from "./lib/acp-line-handler.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PUBLIC = join(__dirname, "public");
@@ -51,8 +60,9 @@ const USER_SUB_URL =
  * (Thought-only streams also count as progress so long reasoning is allowed.)
  * Absolute max wall time still applies.
  */
+/** No user-visible message/tool progress for this long → hang recovery. */
 const JOB_IDLE_TIMEOUT_MS = Number(
-  process.env.PHONE_CHAT_JOB_IDLE_TIMEOUT_MS || 4 * 60 * 1000
+  process.env.PHONE_CHAT_JOB_IDLE_TIMEOUT_MS || 90 * 1000
 );
 const JOB_MAX_TIMEOUT_MS = Number(
   process.env.PHONE_CHAT_JOB_TIMEOUT_MS || 45 * 60 * 1000
@@ -254,6 +264,37 @@ function isUsageIntent(text) {
   return false;
 }
 
+/**
+ * Trivial cwd/folder questions — answer instantly without the agent tool loop.
+ * (Agent often hangs after "I'll check pwd..." with a stuck shell tool.)
+ */
+function isCwdIntent(text) {
+  const t = String(text || "").trim();
+  if (!t || t.length > 120) return false;
+  if (
+    /^(what|which)\s+(folder|directory|dir|path|cwd)\b/i.test(t) ||
+    /^(what|which)\s+folder\s+are\s+we\s+in\b/i.test(t) ||
+    /^where\s+am\s+i\b/i.test(t) ||
+    /^where\s+are\s+we\b/i.test(t) ||
+    /^(pwd|cwd)\s*\??$/i.test(t) ||
+    /^what('s| is)\s+(the\s+)?(current\s+)?(working\s+)?(folder|directory|dir|path|cwd)\b/i.test(
+      t
+    ) ||
+    /^what\s+folder\s+(are|is)\s+(we|i|you)\s+in\b/i.test(t)
+  ) {
+    return true;
+  }
+  return false;
+}
+
+function formatCwdReport() {
+  return [
+    `**Folder (agent cwd):** \`${CWD}\``,
+    "",
+    "This is the phone bridge workspace (`PHONE_CHAT_CWD` / default parent of the app). The agent runs tools from here unless a command uses another absolute path.",
+  ].join("\n");
+}
+
 // ─── ACP client (long-lived grok agent stdio) ───────────────────────────────
 
 class GrokAcp {
@@ -262,10 +303,25 @@ class GrokAcp {
     this.proc = null;
     this.rl = null;
     this.nextId = 1;
-    this.pending = new Map();
     this.sessionId = null;
     this.listeners = new Set();
     this.ready = null;
+    /** Handles agent→client terminal/* requests (required when terminal:true). */
+    this.terminals = new TerminalManager();
+    this.allowedRoots = defaultAllowedRoots(cwd);
+    /** Shared demux + agent-request answers (same code path unit tests drive). */
+    this.lineHandler = new AcpLineHandler({
+      terminals: this.terminals,
+      allowedRoots: this.allowedRoots,
+      writeMessage: (obj) => this._writeMessage(obj),
+      onSessionUpdate: (update) => this.emit(update),
+      onWarn: (msg) => console.warn(`[acp] ${msg}`),
+    });
+  }
+
+  /** @returns {Map<string|number, {resolve: Function, reject: Function}>} */
+  get pending() {
+    return this.lineHandler.pending;
   }
 
   onUpdate(fn) {
@@ -291,14 +347,11 @@ class GrokAcp {
 
   /** Kill agent process and reject in-flight ACP requests. */
   async stop() {
-    const pending = [...this.pending.values()];
-    this.pending.clear();
-    for (const p of pending) {
-      try {
-        p.reject(new Error("agent reset"));
-      } catch {
-        /* ignore */
-      }
+    this.lineHandler.clearPending("agent reset");
+    try {
+      await this.terminals.releaseAll();
+    } catch {
+      /* ignore */
     }
     if (this.rl) {
       try {
@@ -354,10 +407,8 @@ class GrokAcp {
       console.error(`[agent] exited code=${code}`);
       this.ready = null;
       this.sessionId = null;
-      for (const [, p] of this.pending) {
-        p.reject(new Error("agent process exited"));
-      }
-      this.pending.clear();
+      this.lineHandler.clearPending("agent process exited");
+      void this.terminals.releaseAll().catch(() => {});
     });
 
     this.rl = createInterface({ input: this.proc.stdout });
@@ -384,39 +435,29 @@ class GrokAcp {
     console.log(`[agent] session ${this.sessionId} cwd=${this.cwd}`);
   }
 
+  /** Demux entry — delegates to AcpLineHandler (shared with unit tests). */
   _onLine(line) {
-    if (!line.trim()) return;
-    let data;
+    this.lineHandler.onLine(line);
+  }
+
+  _writeMessage(obj) {
+    if (!this.proc?.stdin || this.proc.stdin.destroyed) return;
     try {
-      data = JSON.parse(line);
-    } catch {
-      return;
-    }
-
-    if (data.method === "session/update" || data.method === "x.ai/session/update") {
-      const params = data.params || {};
-      const update = params.update || params;
-      this.emit(update);
-      return;
-    }
-
-    if (data.id != null && this.pending.has(data.id)) {
-      const p = this.pending.get(data.id);
-      this.pending.delete(data.id);
-      if (data.error) p.reject(new Error(data.error.message || JSON.stringify(data.error)));
-      else p.resolve(data.result ?? {});
+      this.proc.stdin.write(JSON.stringify(obj) + "\n");
+    } catch (e) {
+      console.warn("[acp] write failed", e.message);
     }
   }
 
   request(method, params, timeoutMs = 15 * 60 * 1000) {
     const id = this.nextId++;
     return new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject });
+      this.lineHandler.trackPending(id, { resolve, reject });
       const msg = JSON.stringify({ jsonrpc: "2.0", id, method, params });
       this.proc.stdin.write(msg + "\n");
       // safety timeout (prompt jobs use a shorter outer race too)
       setTimeout(() => {
-        if (this.pending.has(id)) {
+        if (this.lineHandler.hasPending(id)) {
           this.pending.delete(id);
           reject(new Error(`ACP timeout: ${method}`));
         }
@@ -1018,7 +1059,8 @@ function looksLikePartialAckOnly(reply, tools) {
   // short opener, no real sections/lists
   if (t.length > 600) return false;
   if (/\n#{1,3}\s|\n[-*]\s|\n\d+\.\s|```/.test(t)) return false;
-  return /^(i('ll| will)|let me|looking|i'm going to|i am going to|checking|i'll check|i'll look)\b/i.test(
+  // Common pre-tool acknowledgements (agent often ends the turn here without the answer)
+  return /^(i('ll| will)|let me|looking|i'm going to|i am going to|checking|i'll check|i'll look|running|executing|i am running|i'm running|on it|one moment|working on)\b/i.test(
     t
   );
 }
@@ -1163,58 +1205,23 @@ async function runAgentTurn(job, promptText, opts = {}) {
       (ev) => {
         job.updatedAt = new Date().toISOString();
         if (ev.type === "update") {
-          const u = ev.update || {};
-          const kind = u.sessionUpdate || u.type;
-          if (kind === "agent_message_chunk") {
-            // Real user-visible progress
-            markProgress();
-            const content = u.content;
-            if (content?.type === "image") {
-              collectImagesFromUpdate(job, {
-                content: [{ type: "content", content }],
-              });
-            } else {
-              const t = content?.text ?? u.text ?? "";
-              if (t) {
-                job.reply += t;
-                for (const p of collectPathsFromText(t)) addReplyImage(job, p);
-              }
-            }
-          } else if (kind === "agent_thought_chunk") {
-            // Thoughts alone do NOT reset the hang timer — high-effort
-            // reasoning can stream for minutes without ever finishing.
-            const t = u.content?.text ?? u.text ?? "";
-            if (t) {
-              job.thought = (job.thought || "") + t;
-              if (job.thought.length > 4000) {
-                job.thought = job.thought.slice(-4000);
-              }
-            }
-          } else if (kind === "tool_call" || kind === "tool_call_update") {
-            markProgress();
-            const name =
-              u._meta?.["x.ai/tool"]?.name ||
-              u.title ||
-              u.tool ||
-              u.kind ||
-              "tool";
-            const status =
-              u.status || (kind === "tool_call" ? "running" : "update");
-            const last = job.tools[job.tools.length - 1];
-            if (last && last.name === name) last.status = status;
-            else job.tools.push({ name, status, at: job.updatedAt });
-            if (job.tools.length > 40) job.tools = job.tools.slice(-40);
-            collectImagesFromUpdate(job, u);
+          // Production progressive path — same function unit tests drive
+          const applied = applySessionUpdate(job, ev.update || {});
+          if (applied.progressed) markProgress();
+          if (applied.imageContent) {
+            collectImagesFromUpdate(job, {
+              content: [{ type: "content", content: applied.imageContent }],
+            });
+          }
+          for (const p of applied.paths || []) addReplyImage(job, p);
+          if (applied.toolUpdate) {
+            collectImagesFromUpdate(job, applied.toolUpdate);
           }
         } else if (ev.type === "done") {
           markProgress();
-          const textOut =
-            ev.result?.text ||
-            (typeof ev.result === "string" ? ev.result : "") ||
-            "";
-          if (!job.reply && textOut) job.reply = textOut;
+          applyPromptDone(job, ev.result);
         }
-        // persist often so phone always has latest partial/final text
+        // persist often so phone always has latest partial/final text + SSE push
         void persistJob(job);
       }
     );
@@ -1261,6 +1268,7 @@ async function runAgentTurn(job, promptText, opts = {}) {
 }
 
 async function runJob(job) {
+  if (job.userFinalized) return; // phone already Stop & show'd
   job.status = "running";
   job.startedAt = job.startedAt || new Date().toISOString();
   job.updatedAt = new Date().toISOString();
@@ -1282,6 +1290,18 @@ async function runJob(job) {
       job.error = e instanceof Error ? e.message : String(e);
       job.reply = `Failed to fetch usage: ${job.error}\n\nTry https://grok.com/?_s=billing`;
     }
+    job.finishedAt = new Date().toISOString();
+    job.updatedAt = job.finishedAt;
+    job.sessionId = agent.sessionId;
+    await persistJob(job);
+    return;
+  }
+
+  // Cwd / "what folder are we in" — instant (agent often hangs on pwd shell)
+  if (isCwdIntent(job.text)) {
+    job.reply = formatCwdReport();
+    job.status = "done";
+    job.error = null;
     job.finishedAt = new Date().toISOString();
     job.updatedAt = job.finishedAt;
     job.sessionId = agent.sessionId;
@@ -1342,14 +1362,16 @@ async function runJob(job) {
 
     lastResult = await runAgentTurn(job, promptText, { attempt });
 
+    // Phone tapped "Stop & show" while we were working
+    if (job.userFinalized) return;
+
     if (lastResult.ok) {
-      // Success — but if we only got a pre-tool ack and tools ran, treat as incomplete and retry
-      if (
-        attempt < maxAttempts &&
-        looksLikePartialAckOnly(job.reply, job.tools)
-      ) {
+      // Success — but if we only got a pre-tool ack and tools ran, treat as incomplete
+      if (looksLikePartialAckOnly(job.reply, job.tools)) {
         console.warn(
-          `[jobs] ${job.id} looks incomplete after attempt ${attempt}, retrying`
+          `[jobs] ${job.id} looks incomplete after attempt ${attempt}${
+            attempt < maxAttempts ? ", retrying" : ", falling back"
+          }`
         );
         lastResult = {
           ok: false,
@@ -1357,7 +1379,8 @@ async function runJob(job) {
           idleTimedOut: false,
           error: "incomplete partial ack",
         };
-        continue;
+        if (attempt < maxAttempts) continue;
+        break; // exhaust agent attempts → headless fallback below
       }
       job.status = "done";
       job.error = null;
@@ -1384,7 +1407,8 @@ async function runJob(job) {
       return;
     }
 
-    // Failed turn — retry agent only for process death / empty; idle hangs go straight to headless
+    // Failed turn — retry agent only for process death / empty / incomplete;
+    // idle hangs go straight to headless (no agent retry loop).
     const canRetry =
       attempt < maxAttempts &&
       !lastResult.idleTimedOut &&
@@ -1398,11 +1422,26 @@ async function runJob(job) {
     await new Promise((r) => setTimeout(r, 800));
   }
 
-  // Agent path failed — headless one-shot so the phone ALWAYS gets a finished reply
+  if (job.userFinalized) return;
+
+  // Agent path failed — headless one-shot so the phone ALWAYS gets a finished reply.
+  // Kill any wedged long-lived ACP session first (unanswered terminal/* / stuck
+  // prompt). agent.start() alone is a no-op when this.ready is still set.
   try {
     console.warn(
       `[jobs] ${job.id} falling back to headless -p after agent failure: ${lastResult.error}`
     );
+    try {
+      await agent.cancel();
+    } catch {
+      /* ignore */
+    }
+    try {
+      await agent.stop();
+    } catch (e) {
+      console.warn("[jobs] agent stop before headless failed", e.message);
+    }
+
     job.tools = job.tools || [];
     job.tools.push({
       name: "headless_fallback",
@@ -1435,29 +1474,27 @@ async function runJob(job) {
     job.finishedAt = new Date().toISOString();
     job.updatedAt = job.finishedAt;
     job.sessionId = agent.sessionId;
-    // Revive long-lived agent for next messages
-    void agent.start().catch(() => {});
+    // Fresh long-lived agent for subsequent phone messages
+    void agent.start().catch((e) =>
+      console.warn("[jobs] agent restart after headless failed", e.message)
+    );
     await persistJob(job);
     return;
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     console.error(`[jobs] ${job.id} headless fallback failed:`, msg);
-    job.status = "error";
-    job.error = `${lastResult.error || "failed"}; headless: ${msg}`;
-    if (!job.reply) {
-      job.reply = `Error: ${job.error}\n\n_(Send the message again.)_`;
-    } else if (
-      !job.reply.includes("Timed out") &&
-      !job.reply.includes("Stopped early") &&
-      !job.reply.includes("interrupted")
-    ) {
-      job.reply =
-        job.reply.trimEnd() +
-        `\n\n_(Stopped early: ${job.error}. Send again if you need the rest.)_`;
-    }
-    job.finishedAt = new Date().toISOString();
-    job.updatedAt = job.finishedAt;
+    forceTerminalizeJob(job, {
+      reason: `${lastResult.error || "failed"}; headless: ${msg}`,
+      status: "error",
+    });
     job.sessionId = agent.sessionId;
+    // Still kill/restart so the next message does not reuse a wedged session
+    try {
+      await agent.stop();
+    } catch {
+      /* ignore */
+    }
+    void agent.start().catch(() => {});
     await persistJob(job);
   }
 }
@@ -1489,35 +1526,92 @@ async function processQueue() {
         }
         await runJob(job);
         // Guarantee terminal status so phone poll always exits
-        if (job.status === "running" || job.status === "queued") {
-          job.status = job.reply ? "done" : "error";
+        if (
+          !job.userFinalized &&
+          !isTerminalJobStatus(job.status)
+        ) {
+          forceTerminalizeJob(job, {
+            reason: job.error || "no terminal status",
+            note: job.reply
+              ? "_(Job ended without a clean terminal status — showing what the Mac had.)_"
+              : false,
+          });
           if (!job.reply) {
             job.reply =
               "Error: job ended without a reply. Please send again.";
             job.error = job.error || "no terminal status";
           }
+          await persistJob(job);
+        }
+      } catch (e) {
+        if (job.userFinalized) {
+          /* phone already took ownership of the result */
+        } else {
+          console.error("[queue] runJob threw", e);
+          job.status = "error";
+          job.error = e instanceof Error ? e.message : String(e);
+          job.reply =
+            (job.reply ? job.reply + "\n\n" : "") +
+            `Error: ${job.error}\n\n_(Send again — this should not happen.)_`;
           job.finishedAt = new Date().toISOString();
           job.updatedAt = job.finishedAt;
           await persistJob(job);
         }
-      } catch (e) {
-        console.error("[queue] runJob threw", e);
-        job.status = "error";
-        job.error = e instanceof Error ? e.message : String(e);
-        job.reply =
-          (job.reply ? job.reply + "\n\n" : "") +
-          `Error: ${job.error}\n\n_(Send again — this should not happen.)_`;
-        job.finishedAt = new Date().toISOString();
-        job.updatedAt = job.finishedAt;
-        await persistJob(job);
       } finally {
-        currentJobId = null;
+        if (currentJobId === id) currentJobId = null;
       }
     }
   } finally {
     queueRunning = false;
     currentJobId = null;
   }
+}
+
+/**
+ * Phone "Stop & show" — end the job now with whatever reply we have so the UI unsticks.
+ * Kills the agent if this is the active job so the queue can continue.
+ */
+async function finalizeJob(id) {
+  const job = await loadJob(id);
+  if (!job) return null;
+  if (
+    job.status === "done" ||
+    job.status === "error" ||
+    job.status === "cancelled"
+  ) {
+    return job;
+  }
+  const idx = jobQueue.indexOf(id);
+  if (idx >= 0) jobQueue.splice(idx, 1);
+
+  const partial = (job.reply || "").trim();
+  job.userFinalized = true; // prevent runJob from overwriting after agent kill
+  job.status = partial ? "done" : "error";
+  job.error = partial ? null : "finalized with no reply";
+  job.reply = partial
+    ? partial +
+      "\n\n_(Stopped early — this is everything the Mac had so far.)_"
+    : "_(Stopped — no reply text yet. Send the question again.)_";
+  job.finishedAt = new Date().toISOString();
+  job.updatedAt = job.finishedAt;
+  await persistJob(job);
+
+  if (currentJobId === id) {
+    try {
+      await agent.cancel();
+    } catch {
+      /* ignore */
+    }
+    try {
+      await agent.reset();
+    } catch {
+      /* ignore */
+    }
+    currentJobId = null;
+    queueRunning = false;
+    void processQueue();
+  }
+  return job;
 }
 
 async function cancelJob(id) {
@@ -1749,6 +1843,14 @@ async function handleReset(req, res) {
 async function handleJobCancel(req, res, id) {
   if (!authOk(req)) return sendJson(res, 401, { error: "unauthorized" });
   const job = await cancelJob(id);
+  if (!job) return sendJson(res, 404, { error: "job not found" });
+  sendJson(res, 200, publicJob(job));
+}
+
+/** POST /api/jobs/:id/finalize — stop job and return whatever reply exists (phone "Stop & show"). */
+async function handleJobFinalize(req, res, id) {
+  if (!authOk(req)) return sendJson(res, 401, { error: "unauthorized" });
+  const job = await finalizeJob(id);
   if (!job) return sendJson(res, 404, { error: "job not found" });
   sendJson(res, 200, publicJob(job));
 }
@@ -2123,6 +2225,12 @@ const server = http.createServer(async (req, res) => {
     );
     if (req.method === "POST" && jobCancel) {
       return await handleJobCancel(req, res, jobCancel[1]);
+    }
+    const jobFinalize = pathOnly.match(
+      /^\/api\/jobs\/([a-f0-9-]+)\/finalize$/i
+    );
+    if (req.method === "POST" && jobFinalize) {
+      return await handleJobFinalize(req, res, jobFinalize[1]);
     }
     const jobMedia = pathOnly.match(
       /^\/api\/jobs\/([a-f0-9-]+)\/media\/(\d+)$/i

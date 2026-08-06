@@ -305,6 +305,16 @@ function addMsg(role, text, opts = {}) {
   body.className = "body";
   setBodyContent(body, text || "", role);
   el.appendChild(body);
+
+  // Job recovery actions when status may not flip to done on its own
+  let actionsEl = null;
+  if (role === "bot") {
+    actionsEl = document.createElement("div");
+    actionsEl.className = "job-actions hidden";
+    el.appendChild(actionsEl);
+    syncJobActions(el, opts.jobId, opts.jobStatus);
+  }
+
   messages.appendChild(el);
   scrollBottom();
 
@@ -327,7 +337,172 @@ function addMsg(role, text, opts = {}) {
     persistHistory();
   }
 
-  return { el, body, thinkingEl };
+  return { el, body, thinkingEl, actionsEl };
+}
+
+function isTerminalJobStatus(st) {
+  return st === "done" || st === "error" || st === "cancelled";
+}
+
+/**
+ * Show Get result / Stop & show under in-progress bot messages.
+ */
+function syncJobActions(msgEl, jobId, jobStatus) {
+  if (!msgEl) return;
+  let actions = msgEl.querySelector(".job-actions");
+  if (!actions) {
+    actions = document.createElement("div");
+    actions.className = "job-actions hidden";
+    msgEl.appendChild(actions);
+  }
+  if (!jobId || isTerminalJobStatus(jobStatus)) {
+    actions.classList.add("hidden");
+    actions.innerHTML = "";
+    return;
+  }
+  actions.classList.remove("hidden");
+  if (actions.dataset.wired === jobId) return;
+  actions.dataset.wired = jobId;
+  actions.innerHTML = "";
+
+  const refreshBtn = document.createElement("button");
+  refreshBtn.type = "button";
+  refreshBtn.className = "job-action-btn";
+  refreshBtn.textContent = "Get result";
+  refreshBtn.title = "Pull the latest status/reply from the Mac right now";
+  refreshBtn.onclick = () => void pullJobResult(jobId, msgEl);
+
+  const stopBtn = document.createElement("button");
+  stopBtn.type = "button";
+  stopBtn.className = "job-action-btn job-action-stop";
+  stopBtn.textContent = "Stop & show";
+  stopBtn.title =
+    "Stop the job on the Mac and show whatever reply it has so far";
+  stopBtn.onclick = () => void stopAndShowJob(jobId, msgEl);
+
+  actions.appendChild(refreshBtn);
+  actions.appendChild(stopBtn);
+}
+
+async function pullJobResult(jobId, msgEl) {
+  const secret = getSecret();
+  if (!secret) return;
+  const bodyEl = msgEl?.querySelector(".body");
+  const thinkingEl = msgEl?.querySelector(".thinking");
+  const actions = msgEl?.querySelector(".job-actions");
+  if (actions) {
+    actions.querySelectorAll("button").forEach((b) => (b.disabled = true));
+  }
+  try {
+    const res = await fetch(`/api/jobs/${jobId}`, {
+      headers: { Authorization: `Bearer ${secret}` },
+      cache: "no-store",
+    });
+    const job = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(job.error || res.statusText);
+
+    // Reuse the same UI path as SSE/poll
+    const toolsLine = job.tools?.length
+      ? job.tools.map((t) => `${t.name} (${t.status})`).join(" · ")
+      : "";
+    if (job.reply) setBodyContent(bodyEl, job.reply, "bot");
+    else if (job.error) setBodyContent(bodyEl, `Error: ${job.error}`, "bot");
+
+    const imageUrls = Array.isArray(job.images)
+      ? job.images.map((im) => im.path || im.url).filter(Boolean)
+      : [];
+    if (imageUrls.length) setReplyImages(msgEl, imageUrls);
+
+    updateHistoryByJobId(jobId, {
+      text: job.reply || (job.error ? `Error: ${job.error}` : "") || "",
+      tools: toolsLine || undefined,
+      jobStatus: job.status,
+      images: imageUrls.length ? imageUrls : undefined,
+    });
+
+    if (isTerminalJobStatus(job.status)) {
+      setThinking(thinkingEl, { hide: true });
+      syncJobActions(msgEl, jobId, job.status);
+      stopJobPoll(jobId);
+      if (!(job.reply || "").trim() && !job.error) {
+        setBodyContent(
+          bodyEl,
+          "_(Still no reply on the Mac. Try Stop & show, or send again.)_",
+          "bot"
+        );
+      }
+    } else {
+      setThinking(thinkingEl, {
+        phase: "Pulled latest — still running on Mac…",
+        tools: toolsLine,
+        thought: job.thought || "",
+      });
+      syncJobActions(msgEl, jobId, job.status);
+      // Ensure watcher is alive
+      if (!activePolls.has(jobId) && bodyEl && thinkingEl) {
+        startJobPoll(jobId, bodyEl, thinkingEl);
+      }
+    }
+    setConn("connected", "ok");
+    scrollBottom();
+  } catch (e) {
+    alert(`Could not pull result: ${e.message || e}`);
+  } finally {
+    if (actions) {
+      actions.querySelectorAll("button").forEach((b) => (b.disabled = false));
+    }
+  }
+}
+
+async function stopAndShowJob(jobId, msgEl) {
+  const secret = getSecret();
+  if (!secret) return;
+  if (
+    !confirm(
+      "Stop this job on the Mac and show whatever it has so far?\n\nThis frees the queue for new messages."
+    )
+  ) {
+    return;
+  }
+  const bodyEl = msgEl?.querySelector(".body");
+  const thinkingEl = msgEl?.querySelector(".thinking");
+  const actions = msgEl?.querySelector(".job-actions");
+  if (actions) {
+    actions.querySelectorAll("button").forEach((b) => (b.disabled = true));
+  }
+  try {
+    const res = await fetch(`/api/jobs/${jobId}/finalize`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${secret}` },
+    });
+    const job = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(job.error || res.statusText);
+
+    setThinking(thinkingEl, { hide: true });
+    if (job.reply) setBodyContent(bodyEl, job.reply, "bot");
+    else setBodyContent(bodyEl, "_(Stopped — no reply yet.)_", "bot");
+
+    const imageUrls = Array.isArray(job.images)
+      ? job.images.map((im) => im.path || im.url).filter(Boolean)
+      : [];
+    if (imageUrls.length) setReplyImages(msgEl, imageUrls);
+
+    updateHistoryByJobId(jobId, {
+      text: job.reply || "",
+      jobStatus: job.status,
+      images: imageUrls.length ? imageUrls : undefined,
+    });
+    syncJobActions(msgEl, jobId, job.status);
+    stopJobPoll(jobId);
+    setConn("connected", "ok");
+    scrollBottom();
+  } catch (e) {
+    alert(`Stop failed: ${e.message || e}`);
+  } finally {
+    if (actions) {
+      actions.querySelectorAll("button").forEach((b) => (b.disabled = false));
+    }
+  }
 }
 
 function updateHistoryByJobId(jobId, patch) {
@@ -423,6 +598,7 @@ function startJobPoll(jobId, bodyEl, thinkingEl) {
       jobStatus: job.status,
       images: imageUrls.length ? imageUrls : undefined,
     });
+    syncJobActions(msgEl, jobId, job.status);
     return { toolsLine, imageUrls, reply };
   };
 
@@ -430,10 +606,12 @@ function startJobPoll(jobId, bodyEl, thinkingEl) {
     if (closed) return;
     applyJobToUi(job);
     setThinking(thinkingEl, { hide: true });
+    const msgEl = bodyEl.closest(".msg");
+    syncJobActions(msgEl, jobId, job.status);
     if (!(job.reply || "").trim() && !job.error) {
       setBodyContent(
         bodyEl,
-        "_(No reply text received. Tap Reset and send again.)_",
+        "_(No reply text received. Tap Get result, or send again.)_",
         "bot"
       );
     }

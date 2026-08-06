@@ -381,6 +381,45 @@ header .status.bad {
   cursor: zoom-in;
 }
 
+/* Manual recovery when status never flips to done */
+.msg .job-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 4px 0 12px;
+}
+
+.msg .job-actions.hidden {
+  display: none;
+}
+
+.msg .job-action-btn {
+  border: 1px solid #333;
+  background: #111;
+  color: #ddd;
+  font-size: 12px;
+  font-weight: 600;
+  padding: 7px 12px;
+  border-radius: 999px;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.msg .job-action-btn:active {
+  background: #1a1a1a;
+  color: #fff;
+}
+
+.msg .job-action-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.msg .job-action-stop {
+  border-color: #444;
+  color: #aaa;
+}
+
 /* Inline thinking / tool status (not header) */
 .msg .thinking {
   font-size: 13px;
