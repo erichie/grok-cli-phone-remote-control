@@ -1,0 +1,29 @@
+{
+  "name": "grok-phone-pwa",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Installable phone PWA that chats with a local Grok Build agent on your computer (ACP stdio bridge)",
+  "license": "MIT",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/erichie/grok-phone-pwa.git"
+  },
+  "scripts": {
+    "start": "node server.mjs",
+    "dev": "node server.mjs",
+    "test": "node --test test/*.test.mjs",
+    "check:leaks": "node scripts/check-no-local-leaks.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "keywords": [
+    "grok",
+    "pwa",
+    "agent",
+    "acp",
+    "phone",
+    "xai"
+  ]
+}

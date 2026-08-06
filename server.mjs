@@ -1,0 +1,2064 @@
+/**
+ * Phone PWA bridge → local `grok agent --always-approve stdio` (ACP).
+ *
+ * Env:
+ *   PHONE_CHAT_SECRET   required shared secret (Authorization: Bearer …)
+ *   PHONE_CHAT_PORT     default 8787
+ *   PHONE_CHAT_HOST     default 0.0.0.0 (LAN) — use 127.0.0.1 for localhost only
+ *   PHONE_CHAT_CWD      default process.cwd() parent or GROK_PHONE_CWD
+ *   GROK_BIN            path to grok binary (default: grok on PATH)
+ *
+ *   npm start
+ *   # on phone (same Wi‑Fi / Tailscale): http://<mac-ip>:8787
+ */
+import http from "node:http";
+import { spawn } from "node:child_process";
+import {
+  createReadStream,
+  existsSync,
+  mkdirSync,
+  writeFileSync,
+  statSync,
+} from "node:fs";
+import { readFile, writeFile, mkdir, readdir, stat, rename } from "node:fs/promises";
+import { join, extname, dirname, resolve, basename } from "node:path";
+import { fileURLToPath } from "node:url";
+import { homedir, tmpdir } from "node:os";
+import { randomUUID } from "node:crypto";
+import { createInterface } from "node:readline";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const PUBLIC = join(__dirname, "public");
+const PORT = Number(process.env.PHONE_CHAT_PORT || 8787);
+const HOST = process.env.PHONE_CHAT_HOST || "0.0.0.0";
+const SECRET = (process.env.PHONE_CHAT_SECRET || "").trim();
+const CWD =
+  process.env.PHONE_CHAT_CWD ||
+  process.env.GROK_PHONE_CWD ||
+  join(__dirname, ".."); // default: parent of this app (set PHONE_CHAT_CWD to override)
+const GROK_BIN = process.env.GROK_BIN || "grok";
+const INBOX = join(homedir(), ".grok", "phone-inbox");
+const JOBS_DIR = join(homedir(), ".grok", "phone-jobs");
+const AUTH_PATH = join(homedir(), ".grok", "auth.json");
+/** Live credit/usage (same source as TUI /usage). */
+const BILLING_CREDITS_URL =
+  "https://cli-chat-proxy.grok.com/v1/billing?format=credits";
+const BILLING_MONTHLY_URL = "https://cli-chat-proxy.grok.com/v1/billing";
+const USER_SUB_URL =
+  "https://cli-chat-proxy.grok.com/v1/user?include=subscription";
+/**
+ * Progress silence: no tool/message chunks for this long → treat as hung and recover.
+ * (Thought-only streams also count as progress so long reasoning is allowed.)
+ * Absolute max wall time still applies.
+ */
+const JOB_IDLE_TIMEOUT_MS = Number(
+  process.env.PHONE_CHAT_JOB_IDLE_TIMEOUT_MS || 4 * 60 * 1000
+);
+const JOB_MAX_TIMEOUT_MS = Number(
+  process.env.PHONE_CHAT_JOB_TIMEOUT_MS || 45 * 60 * 1000
+);
+/** Auto-retry once when the agent dies or returns only a partial first line. */
+const JOB_AUTO_RETRIES = Number(process.env.PHONE_CHAT_JOB_AUTO_RETRIES || 1);
+
+if (!SECRET) {
+  console.error(
+    "Set PHONE_CHAT_SECRET (shared password for the phone app).\n  export PHONE_CHAT_SECRET='your-long-random-secret'"
+  );
+  process.exit(1);
+}
+
+mkdirSync(INBOX, { recursive: true });
+mkdirSync(JOBS_DIR, { recursive: true });
+
+// ─── Local billing / usage (do NOT send /usage to the agent) ─────────────────
+
+function unwrapVal(v) {
+  if (v == null) return null;
+  if (typeof v === "object" && "val" in v) return v.val;
+  return v;
+}
+
+function centsToUsd(cents) {
+  if (cents == null || Number.isNaN(Number(cents))) return null;
+  return (Number(cents) / 100).toLocaleString("en-US", {
+    style: "currency",
+    currency: "USD",
+  });
+}
+
+function pct(n) {
+  if (n == null || Number.isNaN(Number(n))) return "—";
+  return `${Number(n).toFixed(Number(n) % 1 === 0 ? 0 : 1)}%`;
+}
+
+function fmtWhen(iso) {
+  if (!iso) return "—";
+  try {
+    return new Date(iso).toLocaleString(undefined, {
+      dateStyle: "medium",
+      timeStyle: "short",
+    });
+  } catch {
+    return String(iso);
+  }
+}
+
+async function readGrokAccessToken() {
+  try {
+    const raw = await readFile(AUTH_PATH, "utf8");
+    const data = JSON.parse(raw);
+    const entry = Object.values(data || {})[0];
+    if (!entry || typeof entry !== "object") return null;
+    return entry.key || entry.access_token || null;
+  } catch {
+    return null;
+  }
+}
+
+async function fetchJsonAuth(url, token, timeoutMs = 8000) {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        Accept: "application/json",
+        "User-Agent": "GrokCLI/phone-pwa",
+      },
+      signal: ctrl.signal,
+    });
+    if (!res.ok) {
+      const body = await res.text().catch(() => "");
+      throw new Error(`HTTP ${res.status}${body ? `: ${body.slice(0, 120)}` : ""}`);
+    }
+    return await res.json();
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+/**
+ * Instant usage report (TUI /usage equivalent). Never routes through the agent.
+ */
+async function formatUsageReport() {
+  const token = await readGrokAccessToken();
+  if (!token) {
+    return [
+      "## Usage",
+      "",
+      "No Grok login found on this Mac (`~/.grok/auth.json`).",
+      "In Terminal run: `grok login`",
+      "",
+      "Manage online: https://grok.com/?_s=billing",
+    ].join("\n");
+  }
+
+  const [creditsR, monthlyR, userR] = await Promise.allSettled([
+    fetchJsonAuth(BILLING_CREDITS_URL, token),
+    fetchJsonAuth(BILLING_MONTHLY_URL, token),
+    fetchJsonAuth(USER_SUB_URL, token),
+  ]);
+
+  const lines = ["## Usage", ""];
+  const user = userR.status === "fulfilled" ? userR.value : null;
+  if (user) {
+    const name = [user.firstName, user.lastName].filter(Boolean).join(" ") || "—";
+    lines.push(`- **Account:** ${user.email || "—"} (${name})`);
+    if (user.subscriptionTier) {
+      lines.push(`- **Plan:** ${user.subscriptionTier}`);
+    }
+    if (user.hasGrokCodeAccess != null) {
+      lines.push(`- **Grok Code access:** ${user.hasGrokCodeAccess ? "yes" : "no"}`);
+    }
+  }
+
+  if (creditsR.status === "fulfilled") {
+    const cfg = creditsR.value?.config || creditsR.value || {};
+    const period = cfg.currentPeriod || {};
+    lines.push("");
+    lines.push("### Credit period");
+    lines.push(
+      `- **Window:** ${period.type || "—"} · ${fmtWhen(period.start || cfg.billingPeriodStart)} → ${fmtWhen(period.end || cfg.billingPeriodEnd)}`
+    );
+    lines.push(`- **Credit usage:** ${pct(cfg.creditUsagePercent)}`);
+    if (cfg.productUsage?.length) {
+      lines.push("- **By product:**");
+      for (const p of cfg.productUsage) {
+        const name = p.product || p.name || "product";
+        const u = p.usagePercent;
+        lines.push(
+          u == null ? `  - ${name}` : `  - ${name}: ${pct(u)}`
+        );
+      }
+    }
+    const onDemandCap = unwrapVal(cfg.onDemandCap);
+    const onDemandUsed = unwrapVal(cfg.onDemandUsed);
+    const prepaid = unwrapVal(cfg.prepaidBalance);
+    if (onDemandCap != null || onDemandUsed != null) {
+      lines.push(
+        `- **On-demand:** ${centsToUsd(onDemandUsed) ?? onDemandUsed ?? 0} used / cap ${centsToUsd(onDemandCap) ?? onDemandCap ?? 0}`
+      );
+    }
+    if (prepaid != null) {
+      lines.push(`- **Prepaid balance:** ${centsToUsd(prepaid) ?? prepaid}`);
+    }
+  } else {
+    lines.push("");
+    lines.push(`_Credit period unavailable: ${creditsR.reason?.message || creditsR.reason}_`);
+  }
+
+  if (monthlyR.status === "fulfilled") {
+    const cfg = monthlyR.value?.config || monthlyR.value || {};
+    const limit = unwrapVal(cfg.monthlyLimit);
+    const used = unwrapVal(cfg.used);
+    lines.push("");
+    lines.push("### Monthly allotment");
+    lines.push(
+      `- **Used:** ${centsToUsd(used) ?? used ?? "—"} / **limit** ${centsToUsd(limit) ?? limit ?? "—"}`
+    );
+    if (limit && used != null && Number(limit) > 0) {
+      lines.push(`- **Of monthly limit:** ${pct((Number(used) / Number(limit)) * 100)}`);
+    }
+    lines.push(
+      `- **Period:** ${fmtWhen(cfg.billingPeriodStart)} → ${fmtWhen(cfg.billingPeriodEnd)}`
+    );
+  }
+
+  lines.push("");
+  lines.push("### Manage");
+  lines.push("- Billing: https://grok.com/?_s=billing");
+  lines.push("- Usage: https://grok.com/?_s=usage");
+  lines.push("");
+  lines.push(
+    "_Pulled live from your Mac’s Grok login — not via the agent tool loop._"
+  );
+  return lines.join("\n");
+}
+
+/** True for /usage, /cost, or plain “what’s my usage” style asks. */
+function isUsageIntent(text) {
+  const t = String(text || "").trim();
+  if (!t) return false;
+  const low = t.toLowerCase();
+  if (low === "/usage" || low === "/cost") return true;
+  if (low.startsWith("/usage ") || low.startsWith("/cost ")) return true;
+  // plain language — keep tight so we don't steal real coding questions
+  if (
+    /^(what'?s|what is|show|check|get|how much)\b.*\b(usage|cost|credits?|billing)\b/i.test(
+      t
+    )
+  ) {
+    return true;
+  }
+  if (/^(my\s+)?(usage|cost|credits?|billing)\s*\??$/i.test(t)) return true;
+  return false;
+}
+
+// ─── ACP client (long-lived grok agent stdio) ───────────────────────────────
+
+class GrokAcp {
+  constructor(cwd) {
+    this.cwd = cwd;
+    this.proc = null;
+    this.rl = null;
+    this.nextId = 1;
+    this.pending = new Map();
+    this.sessionId = null;
+    this.listeners = new Set();
+    this.ready = null;
+  }
+
+  onUpdate(fn) {
+    this.listeners.add(fn);
+    return () => this.listeners.delete(fn);
+  }
+
+  emit(update) {
+    for (const fn of this.listeners) {
+      try {
+        fn(update);
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+
+  async start() {
+    if (this.ready) return this.ready;
+    this.ready = this._start();
+    return this.ready;
+  }
+
+  /** Kill agent process and reject in-flight ACP requests. */
+  async stop() {
+    const pending = [...this.pending.values()];
+    this.pending.clear();
+    for (const p of pending) {
+      try {
+        p.reject(new Error("agent reset"));
+      } catch {
+        /* ignore */
+      }
+    }
+    if (this.rl) {
+      try {
+        this.rl.close();
+      } catch {
+        /* ignore */
+      }
+      this.rl = null;
+    }
+    const proc = this.proc;
+    this.proc = null;
+    this.ready = null;
+    this.sessionId = null;
+    this.nextId = 1;
+    if (proc && !proc.killed) {
+      try {
+        proc.kill("SIGTERM");
+      } catch {
+        /* ignore */
+      }
+      // hard kill hung agents (0% CPU stuck mid-turn)
+      await new Promise((r) => setTimeout(r, 400));
+      try {
+        if (!proc.killed) proc.kill("SIGKILL");
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+
+  /** Stop + start a fresh agent session (phone Reset). */
+  async reset() {
+    await this.stop();
+    await new Promise((r) => setTimeout(r, 400));
+    return this.start();
+  }
+
+  async _start() {
+    this.proc = spawn(
+      GROK_BIN,
+      ["agent", "--always-approve", "stdio"],
+      {
+        cwd: this.cwd,
+        stdio: ["pipe", "pipe", "pipe"],
+        env: { ...process.env },
+      }
+    );
+    this.proc.stderr?.on("data", (c) => {
+      const s = c.toString("utf8");
+      if (process.env.PHONE_CHAT_DEBUG) process.stderr.write(`[grok] ${s}`);
+    });
+    this.proc.on("exit", (code) => {
+      console.error(`[agent] exited code=${code}`);
+      this.ready = null;
+      this.sessionId = null;
+      for (const [, p] of this.pending) {
+        p.reject(new Error("agent process exited"));
+      }
+      this.pending.clear();
+    });
+
+    this.rl = createInterface({ input: this.proc.stdout });
+    this.rl.on("line", (line) => this._onLine(line));
+
+    await this.request("initialize", {
+      protocolVersion: "1",
+      clientInfo: { name: "grok-phone-pwa", version: "0.1.0" },
+      clientCapabilities: {
+        fs: { readTextFile: true, writeTextFile: true },
+        terminal: true,
+      },
+    });
+
+    const sess = await this.request("session/new", {
+      cwd: this.cwd,
+      mcpServers: [],
+      _meta: { yoloMode: true },
+    });
+    this.sessionId = sess.sessionId || sess.session_id;
+    if (!this.sessionId) {
+      throw new Error("session/new did not return sessionId: " + JSON.stringify(sess));
+    }
+    console.log(`[agent] session ${this.sessionId} cwd=${this.cwd}`);
+  }
+
+  _onLine(line) {
+    if (!line.trim()) return;
+    let data;
+    try {
+      data = JSON.parse(line);
+    } catch {
+      return;
+    }
+
+    if (data.method === "session/update" || data.method === "x.ai/session/update") {
+      const params = data.params || {};
+      const update = params.update || params;
+      this.emit(update);
+      return;
+    }
+
+    if (data.id != null && this.pending.has(data.id)) {
+      const p = this.pending.get(data.id);
+      this.pending.delete(data.id);
+      if (data.error) p.reject(new Error(data.error.message || JSON.stringify(data.error)));
+      else p.resolve(data.result ?? {});
+    }
+  }
+
+  request(method, params, timeoutMs = 15 * 60 * 1000) {
+    const id = this.nextId++;
+    return new Promise((resolve, reject) => {
+      this.pending.set(id, { resolve, reject });
+      const msg = JSON.stringify({ jsonrpc: "2.0", id, method, params });
+      this.proc.stdin.write(msg + "\n");
+      // safety timeout (prompt jobs use a shorter outer race too)
+      setTimeout(() => {
+        if (this.pending.has(id)) {
+          this.pending.delete(id);
+          reject(new Error(`ACP timeout: ${method}`));
+        }
+      }, timeoutMs);
+    });
+  }
+
+  /** Best-effort cancel of the in-flight prompt (if supported). */
+  async cancel() {
+    if (!this.sessionId || !this.proc) return;
+    try {
+      // fire-and-forget — some agents ignore unknown methods
+      const id = this.nextId++;
+      this.proc.stdin.write(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id,
+          method: "session/cancel",
+          params: { sessionId: this.sessionId },
+        }) + "\n"
+      );
+    } catch {
+      /* ignore */
+    }
+  }
+
+  /**
+   * @param {{ text: string, imagePaths?: string[] }} input
+   * @param {(ev: object) => void} onEvent
+   */
+  async prompt(input, onEvent) {
+    await this.start();
+    const parts = [];
+    if (input.text?.trim()) {
+      parts.push({ type: "text", text: input.text.trim() });
+    }
+    // Prefer filesystem paths — Grok Build can read images via tools reliably.
+    for (const p of input.imagePaths || []) {
+      parts.push({
+        type: "text",
+        text: `\n[Phone attachment saved at: ${p}]\nPlease open/view this image if relevant to the request.`,
+      });
+      // Also try ACP image block if supported (ignored if not)
+      try {
+        const buf = await readFile(p);
+        const mime =
+          extname(p).toLowerCase() === ".png"
+            ? "image/png"
+            : extname(p).toLowerCase() === ".webp"
+              ? "image/webp"
+              : "image/jpeg";
+        parts.push({
+          type: "image",
+          mimeType: mime,
+          data: buf.toString("base64"),
+        });
+      } catch {
+        /* path text is enough */
+      }
+    }
+    if (!parts.length) {
+      throw new Error("empty message");
+    }
+
+    const unsub = this.onUpdate((update) => {
+      onEvent?.({ type: "update", update });
+    });
+
+    try {
+      const result = await this.request("session/prompt", {
+        sessionId: this.sessionId,
+        prompt: parts,
+      });
+      onEvent?.({ type: "done", result });
+      return result;
+    } finally {
+      unsub();
+    }
+  }
+}
+
+const agent = new GrokAcp(CWD);
+// warm start + recover jobs left "running" after last crash/restart
+recoverJobsOnStartup()
+  .then(() => agent.start())
+  .catch((e) => console.error("[agent] start failed:", e.message));
+// every 15s: unstick jobs that claim running but aren't being processed
+setInterval(() => {
+  void sweepOrphanJobs();
+}, 15_000);
+
+// ─── HTTP ───────────────────────────────────────────────────────────────────
+
+const MIME = {
+  ".html": "text/html; charset=utf-8",
+  ".js": "application/javascript; charset=utf-8",
+  ".css": "text/css; charset=utf-8",
+  ".webmanifest": "application/manifest+json",
+  ".json": "application/json",
+  ".png": "image/png",
+  ".svg": "image/svg+xml",
+  ".ico": "image/x-icon",
+};
+
+function authOk(req) {
+  const h = req.headers.authorization || "";
+  if (h === `Bearer ${SECRET}`) return true;
+  const url = new URL(req.url || "/", `http://${req.headers.host}`);
+  if (url.searchParams.get("token") === SECRET) return true;
+  return false;
+}
+
+function sendJson(res, code, obj) {
+  res.writeHead(code, {
+    "Content-Type": "application/json",
+    "Access-Control-Allow-Origin": "*",
+  });
+  res.end(JSON.stringify(obj));
+}
+
+async function readBody(req) {
+  const chunks = [];
+  for await (const c of req) chunks.push(c);
+  return Buffer.concat(chunks);
+}
+
+// ─── Durable job queue (work on Mac; phone can lock / disconnect) ───────────
+/** @type {Map<string, object>} */
+const jobs = new Map();
+/** @type {string[]} */
+const jobQueue = [];
+let queueRunning = false;
+/** @type {string | null} */
+let currentJobId = null;
+
+function jobPath(id) {
+  return join(JOBS_DIR, `${id}.json`);
+}
+
+/**
+ * After a Mac bridge restart, jobs left as "running" would poll forever on the
+ * phone (first reply only). Mark them interrupted; re-queue anything still queued.
+ */
+async function recoverJobsOnStartup() {
+  let interrupted = 0;
+  let requeued = 0;
+  let names = [];
+  try {
+    names = await readdir(JOBS_DIR);
+  } catch {
+    return;
+  }
+  for (const name of names) {
+    if (!name.endsWith(".json")) continue;
+    let job;
+    try {
+      job = JSON.parse(await readFile(join(JOBS_DIR, name), "utf8"));
+    } catch {
+      continue;
+    }
+    if (!job?.id) continue;
+    jobs.set(job.id, job);
+    if (job.status === "running") {
+      job.status = "error";
+      job.error = "interrupted by server restart";
+      const note =
+        "\n\n_(Interrupted — Mac bridge restarted mid-reply. Send the message again to continue.)_";
+      if (!(job.reply || "").includes("Interrupted — Mac bridge")) {
+        job.reply = (job.reply || "").trimEnd() + note;
+      }
+      job.finishedAt = new Date().toISOString();
+      job.updatedAt = job.finishedAt;
+      await persistJob(job);
+      interrupted++;
+    } else if (job.status === "queued") {
+      if (!jobQueue.includes(job.id)) {
+        jobQueue.push(job.id);
+        requeued++;
+      }
+    }
+  }
+  if (interrupted || requeued) {
+    console.log(
+      `[jobs] startup recovery: interrupted=${interrupted} requeued=${requeued}`
+    );
+  }
+  if (requeued) void processQueue();
+}
+
+/**
+ * Catch jobs left "running" only after a true crash (not mid-turn).
+ * Must NEVER kill the job that processQueue is actively running — that was
+ * aborting real work and leaving the phone with only the first line.
+ */
+async function sweepOrphanJobs() {
+  const now = Date.now();
+  const ORPHAN_AGE_MS = 15 * 60 * 1000; // 15m of no updates AND not current
+
+  for (const [id, job] of jobs) {
+    if (job.status !== "running") continue;
+    // Never touch the active job, even if it's been silent for a while —
+    // runAgentTurn's idle watchdog owns that case.
+    if (id === currentJobId) continue;
+    if (queueRunning && jobQueue.includes(id)) continue;
+
+    const updated = Date.parse(job.updatedAt || job.startedAt || 0) || 0;
+    if (now - updated < ORPHAN_AGE_MS) continue;
+
+    job.status = "error";
+    job.error = "orphaned (not processing)";
+    const note =
+      "\n\n_(Stopped — job was stuck after a disconnect. Send again if you still need an answer.)_";
+    if (!(job.reply || "").includes("Stopped — job was stuck")) {
+      job.reply = (job.reply || "").trimEnd() + note;
+    }
+    job.finishedAt = new Date().toISOString();
+    job.updatedAt = job.finishedAt;
+    await persistJob(job);
+    console.warn(
+      `[jobs] swept orphan running job ${id} (silent ${Math.round((now - updated) / 1000)}s, current=${currentJobId})`
+    );
+  }
+
+  // Disk-only: only after long silence, never if it matches currentJobId
+  try {
+    const names = await readdir(JOBS_DIR);
+    for (const name of names) {
+      if (!name.endsWith(".json")) continue;
+      const id = name.replace(/\.json$/, "");
+      if (id === currentJobId) continue;
+      if (jobs.has(id)) continue;
+      try {
+        let job;
+        const raw = await readFile(join(JOBS_DIR, name), "utf8");
+        try {
+          job = JSON.parse(raw);
+        } catch {
+          job = JSON.parse(
+            raw.slice(raw.indexOf("{"), raw.lastIndexOf("}") + 1)
+          );
+        }
+        if (job.status !== "running") {
+          jobs.set(job.id, job);
+          continue;
+        }
+        const updated = Date.parse(job.updatedAt || job.startedAt || 0) || 0;
+        if (now - updated < ORPHAN_AGE_MS) {
+          jobs.set(job.id, job);
+          continue;
+        }
+        job.status = "error";
+        job.error = "orphaned (not processing)";
+        job.reply =
+          (job.reply || "").trimEnd() +
+          "\n\n_(Stopped — job was stuck after a disconnect. Send again if you still need an answer.)_";
+        job.finishedAt = new Date().toISOString();
+        job.updatedAt = job.finishedAt;
+        jobs.set(job.id, job);
+        await persistJob(job);
+      } catch {
+        /* ignore */
+      }
+    }
+  } catch {
+    /* ignore */
+  }
+}
+
+function publicJob(job) {
+  const replyImages = Array.isArray(job.replyImages) ? job.replyImages : [];
+  return {
+    id: job.id,
+    status: job.status,
+    text: job.text,
+    createdAt: job.createdAt,
+    updatedAt: job.updatedAt,
+    startedAt: job.startedAt || null,
+    finishedAt: job.finishedAt || null,
+    reply: job.reply || "",
+    /** Latest reasoning/thought stream from the agent (for inline UI). */
+    thought: job.thought || "",
+    tools: job.tools || [],
+    error: job.error || null,
+    queuePosition:
+      job.status === "queued" ? Math.max(0, jobQueue.indexOf(job.id) + 1) : 0,
+    sessionId: job.sessionId || null,
+    /** Generated images (Imagine etc.) — client loads via /api/jobs/:id/media/:i */
+    images: replyImages.map((p, i) => ({
+      index: i,
+      name: basename(String(p)),
+      path: `/api/jobs/${job.id}/media/${i}`,
+    })),
+  };
+}
+
+// ─── Reply image capture (image_gen / image_edit / …) ───────────────────────
+
+const IMAGE_EXT_RE = /\.(png|jpe?g|webp|gif|tiff?)$/i;
+const IMAGE_TOOL_RAW_TYPES = new Set([
+  "ImageGen",
+  "ImageEdit",
+  "ImageToVideo",
+  "ReferenceToVideo",
+]);
+
+function sessionImagesDir(sessionId) {
+  if (!sessionId) return null;
+  // Grok stores sessions as ~/.grok/sessions/<url-encoded-cwd>/<sessionId>/
+  return join(
+    homedir(),
+    ".grok",
+    "sessions",
+    encodeURIComponent(CWD),
+    sessionId,
+    "images"
+  );
+}
+
+function addReplyImage(job, absPath) {
+  if (!absPath || typeof absPath !== "string") return;
+  const p = absPath.trim().replace(/^['"`]+|['"`]+$/g, "");
+  if (!p.startsWith("/") || !IMAGE_EXT_RE.test(p)) return;
+  if (!existsSync(p)) return;
+  if (!Array.isArray(job.replyImages)) job.replyImages = [];
+  if (!job.replyImages.includes(p)) {
+    job.replyImages.push(p);
+  }
+}
+
+function collectPathsFromText(text) {
+  if (!text || typeof text !== "string") return [];
+  const out = [];
+  // Absolute paths to image files
+  const re =
+    /(\/(?:Users|Volumes|home|tmp|var)[^\s`'"<>\]\)]+\.(?:png|jpe?g|webp|gif|tiff?))/gi;
+  for (const m of text.matchAll(re)) out.push(m[1]);
+  // JSON blobs from tool content: {"path":"..."}
+  try {
+    const j = JSON.parse(text);
+    if (j && typeof j.path === "string") out.push(j.path);
+    if (Array.isArray(j?.paths)) {
+      for (const p of j.paths) if (typeof p === "string") out.push(p);
+    }
+  } catch {
+    /* not json */
+  }
+  return out;
+}
+
+function collectImagesFromUpdate(job, u) {
+  if (!u || typeof u !== "object") return;
+
+  const raw = u.rawOutput;
+  if (raw && typeof raw === "object") {
+    if (IMAGE_TOOL_RAW_TYPES.has(raw.type) && raw.path) {
+      addReplyImage(job, raw.path);
+    }
+    if (typeof raw.path === "string" && IMAGE_EXT_RE.test(raw.path)) {
+      addReplyImage(job, raw.path);
+    }
+    // some variants nest under Content
+    if (raw.Content?.path) addReplyImage(job, raw.Content.path);
+  }
+
+  const metaTool = u._meta?.["x.ai/tool"] || {};
+  const toolName = metaTool.name || u.title || "";
+  const isImageTool =
+    /image_gen|image_edit|image_to_video|reference_to_video/i.test(
+      String(toolName)
+    ) || metaTool.kind === "image_gen";
+
+  const content = u.content;
+  if (Array.isArray(content)) {
+    for (const block of content) {
+      const inner = block?.content || block;
+      if (!inner || typeof inner !== "object") continue;
+      if (inner.type === "image") {
+        // inline base64 — persist under phone-inbox for serving
+        if (inner.data && typeof inner.data === "string") {
+          try {
+            const mime = inner.mimeType || "image/png";
+            const ext = mime.includes("jpeg") || mime.includes("jpg")
+              ? ".jpg"
+              : mime.includes("webp")
+                ? ".webp"
+                : ".png";
+            const dest = join(INBOX, `gen-${randomUUID()}${ext}`);
+            writeFileSync(dest, Buffer.from(inner.data, "base64"));
+            addReplyImage(job, dest);
+          } catch (e) {
+            console.warn("[images] save inline image failed", e.message);
+          }
+        }
+        if (inner.uri || inner.url) {
+          const uri = String(inner.uri || inner.url);
+          if (uri.startsWith("/") && IMAGE_EXT_RE.test(uri)) {
+            addReplyImage(job, uri);
+          }
+        }
+      }
+      if (inner.type === "text" && typeof inner.text === "string") {
+        for (const p of collectPathsFromText(inner.text)) {
+          addReplyImage(job, p);
+        }
+      }
+    }
+  }
+
+  // locations sometimes list generated files
+  if (Array.isArray(u.locations)) {
+    for (const loc of u.locations) {
+      if (loc?.path && IMAGE_EXT_RE.test(loc.path)) addReplyImage(job, loc.path);
+    }
+  }
+
+  // rawInput for image tools may only have prompts; skip unless completed with path
+  if (isImageTool && u.status === "completed") {
+    for (const p of collectPathsFromText(JSON.stringify(u).slice(0, 8000))) {
+      addReplyImage(job, p);
+    }
+  }
+}
+
+async function scanNewSessionImages(job, sessionId, sinceMs) {
+  const dir = sessionImagesDir(sessionId);
+  if (!dir || !existsSync(dir)) return;
+  try {
+    const names = await readdir(dir);
+    for (const name of names) {
+      if (!IMAGE_EXT_RE.test(name)) continue;
+      const full = join(dir, name);
+      try {
+        const st = await stat(full);
+        // include files created/modified during this job (small skew)
+        if (st.mtimeMs >= sinceMs - 2000) {
+          addReplyImage(job, full);
+        }
+      } catch {
+        /* skip */
+      }
+    }
+  } catch (e) {
+    console.warn("[images] session scan failed", e.message);
+  }
+}
+
+/** Append markdown image embeds so text clients still see them. */
+function appendImageMarkdown(job) {
+  const imgs = job.replyImages || [];
+  if (!imgs.length) return;
+  const already = job.reply || "";
+  const lines = [];
+  for (let i = 0; i < imgs.length; i++) {
+    const name = basename(imgs[i]);
+    // relative API path — client may also render via job.images
+    const md = `![${name}](/api/jobs/${job.id}/media/${i})`;
+    if (!already.includes(`/media/${i}`) && !already.includes(name)) {
+      lines.push(md);
+    }
+  }
+  if (lines.length) {
+    job.reply = (already ? already.replace(/\s*$/, "\n\n") : "") + lines.join("\n\n");
+  }
+}
+
+function isAllowedMediaPath(absPath) {
+  if (!absPath || typeof absPath !== "string") return false;
+  const resolved = resolve(absPath);
+  const allowedRoots = [
+    resolve(join(homedir(), ".grok")),
+    resolve(INBOX),
+    resolve(tmpdir()),
+    resolve(CWD),
+  ];
+  return allowedRoots.some(
+    (root) => resolved === root || resolved.startsWith(root + "/")
+  );
+}
+
+/** Serialize disk writes per job so concurrent stream updates never corrupt JSON. */
+const persistChains = new Map();
+
+async function persistJob(job) {
+  if (!job?.id) return;
+  jobs.set(job.id, job);
+  const id = job.id;
+  const prev = persistChains.get(id) || Promise.resolve();
+  const next = prev
+    .catch(() => {})
+    .then(async () => {
+      // snapshot fields for a consistent write
+      const snapshot = JSON.stringify(jobs.get(id) || job);
+      const dest = jobPath(id);
+      const tmp = dest + `.${process.pid}.${Date.now()}.tmp`;
+      await writeFile(tmp, snapshot, "utf8");
+      await rename(tmp, dest);
+    })
+    .catch((e) => {
+      console.warn("[jobs] persist failed", id, e.message);
+    })
+    .finally(() => {
+      if (persistChains.get(id) === next) persistChains.delete(id);
+    });
+  persistChains.set(id, next);
+  return next;
+}
+
+async function loadJob(id) {
+  if (jobs.has(id)) return jobs.get(id);
+  try {
+    const raw = await readFile(jobPath(id), "utf8");
+    // tolerate rare corruption from older non-atomic writes
+    let job;
+    try {
+      job = JSON.parse(raw);
+    } catch {
+      const dec = JSON;
+      // take first complete JSON value
+      const parser = JSON.parse;
+      try {
+        const start = raw.indexOf("{");
+        let depth = 0;
+        let end = -1;
+        for (let i = start; i < raw.length; i++) {
+          if (raw[i] === "{") depth++;
+          else if (raw[i] === "}") {
+            depth--;
+            if (depth === 0) {
+              end = i + 1;
+              break;
+            }
+          }
+        }
+        if (start >= 0 && end > start) job = JSON.parse(raw.slice(start, end));
+        else throw new Error("unrecoverable");
+      } catch {
+        return null;
+      }
+    }
+    jobs.set(id, job);
+    return job;
+  } catch {
+    return null;
+  }
+}
+
+/** True if the reply looks like only a pre-tool "I'll look into it" line. */
+function looksLikePartialAckOnly(reply, tools) {
+  const t = String(reply || "").trim();
+  if (!t) return true;
+  if ((tools || []).length === 0) return false;
+  // short opener, no real sections/lists
+  if (t.length > 600) return false;
+  if (/\n#{1,3}\s|\n[-*]\s|\n\d+\.\s|```/.test(t)) return false;
+  return /^(i('ll| will)|let me|looking|i'm going to|i am going to|checking|i'll check|i'll look)\b/i.test(
+    t
+  );
+}
+
+/**
+ * Headless one-shot fallback when the long-lived agent hangs mid-turn.
+ * Always returns a finished string (or throws).
+ */
+function runHeadlessPrompt(promptText, cwd, timeoutMs = 8 * 60 * 1000) {
+  return new Promise((resolve, reject) => {
+    const args = [
+      "--always-approve",
+      "--cwd",
+      cwd,
+      "-p",
+      promptText,
+      "--output-format",
+      "plain",
+    ];
+    const proc = spawn(GROK_BIN, args, {
+      cwd,
+      stdio: ["ignore", "pipe", "pipe"],
+      env: { ...process.env },
+    });
+    let out = "";
+    let err = "";
+    const timer = setTimeout(() => {
+      try {
+        proc.kill("SIGKILL");
+      } catch {
+        /* ignore */
+      }
+      reject(new Error(`headless timeout after ${Math.round(timeoutMs / 1000)}s`));
+    }, timeoutMs);
+    proc.stdout?.on("data", (c) => {
+      out += c.toString("utf8");
+    });
+    proc.stderr?.on("data", (c) => {
+      err += c.toString("utf8");
+    });
+    proc.on("error", (e) => {
+      clearTimeout(timer);
+      reject(e);
+    });
+    proc.on("exit", (code) => {
+      clearTimeout(timer);
+      const text = out.trim();
+      if (text) resolve(text);
+      else
+        reject(
+          new Error(
+            `headless exit ${code}${err ? `: ${err.slice(0, 200)}` : ""}`
+          )
+        );
+    });
+  });
+}
+
+function isTransientAgentError(msg) {
+  const m = String(msg || "").toLowerCase();
+  return (
+    m.includes("agent process exited") ||
+    m.includes("agent reset") ||
+    m.includes("acp timeout") ||
+    m.includes("econnreset") ||
+    m.includes("write after end") ||
+    m.includes("stdin") ||
+    m.includes("not ready")
+  );
+}
+
+/**
+ * One agent turn with idle + max timeouts. Mutates job.reply/tools/images.
+ * @returns {{ ok: boolean, timedOut: boolean, idleTimedOut: boolean, error?: string }}
+ */
+async function runAgentTurn(job, promptText, opts = {}) {
+  const attempt = opts.attempt || 1;
+  let timedOut = false;
+  let idleTimedOut = false;
+  const turnStartMs = Date.now();
+  let lastProgressMs = Date.now();
+
+  const wantsImage =
+    /\b(image_gen|image_edit|imagine|\/imagine|render|photo|picture|illustration)\b/i.test(
+      promptText
+    ) ||
+    /\b(generate|create|draw|make)\b.+\b(image|photo|picture|render)\b/i.test(
+      promptText
+    );
+  const idleMs = wantsImage
+    ? Math.max(JOB_IDLE_TIMEOUT_MS, 8 * 60 * 1000)
+    : JOB_IDLE_TIMEOUT_MS;
+  const maxMs = wantsImage
+    ? Math.max(JOB_MAX_TIMEOUT_MS, 30 * 60 * 1000)
+    : JOB_MAX_TIMEOUT_MS;
+
+  const killForTimeout = (reason) => {
+    if (timedOut) return;
+    timedOut = true;
+    idleTimedOut = reason === "idle";
+    console.warn(
+      `[jobs] ${job.id} timeout reason=${reason} attempt=${attempt} silent=${Math.round((Date.now() - lastProgressMs) / 1000)}s`
+    );
+    void agent.cancel();
+    void agent.reset().catch((e) =>
+      console.warn("[jobs] reset after timeout", e.message)
+    );
+  };
+
+  const markProgress = () => {
+    lastProgressMs = Date.now();
+    job.updatedAt = new Date().toISOString();
+  };
+
+  // Interval watchdog is more reliable than a single setTimeout when the
+  // event loop is busy or the agent hangs at 0% CPU with no events.
+  const watch = setInterval(() => {
+    const now = Date.now();
+    if (now - turnStartMs >= maxMs) {
+      killForTimeout("max");
+    } else if (now - lastProgressMs >= idleMs) {
+      killForTimeout("idle");
+    }
+  }, 2000);
+
+  // Ensure agent is up before prompting
+  try {
+    await agent.start();
+  } catch (e) {
+    clearInterval(watch);
+    return {
+      ok: false,
+      timedOut: false,
+      idleTimedOut: false,
+      error: e instanceof Error ? e.message : String(e),
+    };
+  }
+
+  try {
+    await agent.prompt(
+      { text: promptText, imagePaths: job.imagePaths || [] },
+      (ev) => {
+        job.updatedAt = new Date().toISOString();
+        if (ev.type === "update") {
+          const u = ev.update || {};
+          const kind = u.sessionUpdate || u.type;
+          if (kind === "agent_message_chunk") {
+            // Real user-visible progress
+            markProgress();
+            const content = u.content;
+            if (content?.type === "image") {
+              collectImagesFromUpdate(job, {
+                content: [{ type: "content", content }],
+              });
+            } else {
+              const t = content?.text ?? u.text ?? "";
+              if (t) {
+                job.reply += t;
+                for (const p of collectPathsFromText(t)) addReplyImage(job, p);
+              }
+            }
+          } else if (kind === "agent_thought_chunk") {
+            // Thoughts alone do NOT reset the hang timer — high-effort
+            // reasoning can stream for minutes without ever finishing.
+            const t = u.content?.text ?? u.text ?? "";
+            if (t) {
+              job.thought = (job.thought || "") + t;
+              if (job.thought.length > 4000) {
+                job.thought = job.thought.slice(-4000);
+              }
+            }
+          } else if (kind === "tool_call" || kind === "tool_call_update") {
+            markProgress();
+            const name =
+              u._meta?.["x.ai/tool"]?.name ||
+              u.title ||
+              u.tool ||
+              u.kind ||
+              "tool";
+            const status =
+              u.status || (kind === "tool_call" ? "running" : "update");
+            const last = job.tools[job.tools.length - 1];
+            if (last && last.name === name) last.status = status;
+            else job.tools.push({ name, status, at: job.updatedAt });
+            if (job.tools.length > 40) job.tools = job.tools.slice(-40);
+            collectImagesFromUpdate(job, u);
+          }
+        } else if (ev.type === "done") {
+          markProgress();
+          const textOut =
+            ev.result?.text ||
+            (typeof ev.result === "string" ? ev.result : "") ||
+            "";
+          if (!job.reply && textOut) job.reply = textOut;
+        }
+        // persist often so phone always has latest partial/final text
+        void persistJob(job);
+      }
+    );
+
+    await scanNewSessionImages(
+      job,
+      agent.sessionId || job.sessionId,
+      turnStartMs
+    );
+    appendImageMarkdown(job);
+
+    if (timedOut) {
+      return {
+        ok: false,
+        timedOut: true,
+        idleTimedOut,
+        error: idleTimedOut
+          ? `idle timeout ${Math.round(idleMs / 1000)}s`
+          : `max timeout ${Math.round((Date.now() - turnStartMs) / 1000)}s`,
+      };
+    }
+    return { ok: true, timedOut: false, idleTimedOut: false };
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    await scanNewSessionImages(
+      job,
+      agent.sessionId || job.sessionId,
+      turnStartMs
+    ).catch(() => {});
+    appendImageMarkdown(job);
+    return {
+      ok: false,
+      timedOut,
+      idleTimedOut,
+      error: timedOut
+        ? idleTimedOut
+          ? `idle timeout ${Math.round(idleMs / 1000)}s`
+          : `max timeout ${Math.round((Date.now() - turnStartMs) / 1000)}s`
+        : msg,
+    };
+  } finally {
+    clearInterval(watch);
+  }
+}
+
+async function runJob(job) {
+  job.status = "running";
+  job.startedAt = job.startedAt || new Date().toISOString();
+  job.updatedAt = new Date().toISOString();
+  if (!job.reply) job.reply = "";
+  if (!job.thought) job.thought = "";
+  if (!job.tools) job.tools = [];
+  if (!job.replyImages) job.replyImages = [];
+  job.attempts = job.attempts || 0;
+  await persistJob(job);
+
+  // Usage must NEVER hit the agent tool-loop (it freezes hunting for APIs).
+  if (isUsageIntent(job.text)) {
+    try {
+      job.reply = await formatUsageReport();
+      job.status = "done";
+      job.error = null;
+    } catch (e) {
+      job.status = "error";
+      job.error = e instanceof Error ? e.message : String(e);
+      job.reply = `Failed to fetch usage: ${job.error}\n\nTry https://grok.com/?_s=billing`;
+    }
+    job.finishedAt = new Date().toISOString();
+    job.updatedAt = job.finishedAt;
+    job.sessionId = agent.sessionId;
+    await persistJob(job);
+    return;
+  }
+
+  // Local slash handlers (instant, no agent)
+  try {
+    const local = await tryLocalSlashCommand(job.text);
+    if (local != null) {
+      job.reply = local;
+      job.status = "done";
+      job.error = null;
+      job.finishedAt = new Date().toISOString();
+      job.updatedAt = job.finishedAt;
+      job.sessionId = agent.sessionId;
+      await persistJob(job);
+      return;
+    }
+  } catch (e) {
+    console.warn("[slash] local handler error", e.message);
+  }
+
+  let promptText = expandSlashForAgent(job.text);
+  let lastResult = { ok: false, timedOut: false, idleTimedOut: false, error: "not started" };
+  const maxAttempts = 1 + Math.max(0, JOB_AUTO_RETRIES);
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    job.attempts = attempt;
+    job.status = "running";
+    job.error = null;
+    // Fresh reply buffer each attempt (keep prior as prefix if retrying partial)
+    if (attempt > 1) {
+      const prior = (job.reply || "").trim();
+      job.reply = "";
+      job.thought = "";
+      job.tools = [];
+      // keep replyImages from earlier attempts
+      promptText =
+        expandSlashForAgent(job.text) +
+        (prior
+          ? `\n\n[System: previous attempt was cut off after a partial reply. Continue and give the COMPLETE final answer now. Partial was:\n${prior.slice(0, 800)}]`
+          : `\n\n[System: previous attempt failed (${lastResult.error || "agent error"}). Retry and give a complete answer.]`);
+      // Ensure a healthy agent process
+      try {
+        await agent.reset();
+      } catch (e) {
+        console.warn("[jobs] agent reset before retry failed", e.message);
+      }
+      console.log(
+        `[jobs] ${job.id} auto-retry attempt=${attempt}/${maxAttempts}`
+      );
+    }
+
+    job.updatedAt = new Date().toISOString();
+    await persistJob(job);
+
+    lastResult = await runAgentTurn(job, promptText, { attempt });
+
+    if (lastResult.ok) {
+      // Success — but if we only got a pre-tool ack and tools ran, treat as incomplete and retry
+      if (
+        attempt < maxAttempts &&
+        looksLikePartialAckOnly(job.reply, job.tools)
+      ) {
+        console.warn(
+          `[jobs] ${job.id} looks incomplete after attempt ${attempt}, retrying`
+        );
+        lastResult = {
+          ok: false,
+          timedOut: false,
+          idleTimedOut: false,
+          error: "incomplete partial ack",
+        };
+        continue;
+      }
+      job.status = "done";
+      job.error = null;
+      if (!job.reply && !(job.replyImages || []).length) {
+        // empty success — retry once if possible
+        if (attempt < maxAttempts) {
+          lastResult = {
+            ok: false,
+            timedOut: false,
+            idleTimedOut: false,
+            error: "empty reply",
+          };
+          continue;
+        }
+        job.reply = "(no text response)";
+      } else if (!job.reply && (job.replyImages || []).length) {
+        job.reply = `Generated ${(job.replyImages || []).length} image(s).`;
+        appendImageMarkdown(job);
+      }
+      job.finishedAt = new Date().toISOString();
+      job.updatedAt = job.finishedAt;
+      job.sessionId = agent.sessionId;
+      await persistJob(job);
+      return;
+    }
+
+    // Failed turn — retry transient agent deaths; don't retry hard idle with no tools
+    const canRetry =
+      attempt < maxAttempts &&
+      (isTransientAgentError(lastResult.error) ||
+        lastResult.error === "incomplete partial ack" ||
+        lastResult.error === "empty reply" ||
+        (lastResult.timedOut && (job.tools || []).length > 0));
+
+    if (!canRetry) break;
+
+    // brief pause before retry
+    await new Promise((r) => setTimeout(r, 800));
+  }
+
+  // Agent path failed — last-resort headless one-shot so the phone ALWAYS gets an answer
+  try {
+    console.warn(
+      `[jobs] ${job.id} falling back to headless -p after agent failure: ${lastResult.error}`
+    );
+    job.tools = job.tools || [];
+    job.tools.push({
+      name: "headless_fallback",
+      status: "running",
+      at: new Date().toISOString(),
+    });
+    await persistJob(job);
+    const partial = (job.reply || "").trim();
+    const fallbackPrompt = [
+      expandSlashForAgent(job.text),
+      "",
+      "IMPORTANT: Give a complete final answer. Do not only say you will look — actually answer.",
+      partial
+        ? `Context from a previous partial attempt (may be incomplete):\n${partial.slice(0, 1200)}`
+        : "",
+    ]
+      .filter(Boolean)
+      .join("\n");
+    const headlessReply = await runHeadlessPrompt(
+      fallbackPrompt,
+      CWD,
+      Math.min(JOB_MAX_TIMEOUT_MS, 10 * 60 * 1000)
+    );
+    job.reply = headlessReply;
+    job.status = "done";
+    job.error = null;
+    const last = job.tools[job.tools.length - 1];
+    if (last?.name === "headless_fallback") last.status = "completed";
+    job.finishedAt = new Date().toISOString();
+    job.updatedAt = job.finishedAt;
+    job.sessionId = agent.sessionId;
+    // Revive long-lived agent for next messages
+    void agent.start().catch(() => {});
+    await persistJob(job);
+    return;
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    console.error(`[jobs] ${job.id} headless fallback failed:`, msg);
+    job.status = "error";
+    job.error = `${lastResult.error || "failed"}; headless: ${msg}`;
+    if (!job.reply) {
+      job.reply = `Error: ${job.error}\n\n_(Send the message again.)_`;
+    } else if (
+      !job.reply.includes("Timed out") &&
+      !job.reply.includes("Stopped early") &&
+      !job.reply.includes("interrupted")
+    ) {
+      job.reply =
+        job.reply.trimEnd() +
+        `\n\n_(Stopped early: ${job.error}. Send again if you need the rest.)_`;
+    }
+    job.finishedAt = new Date().toISOString();
+    job.updatedAt = job.finishedAt;
+    job.sessionId = agent.sessionId;
+    await persistJob(job);
+  }
+}
+
+async function processQueue() {
+  if (queueRunning) return;
+  queueRunning = true;
+  try {
+    while (jobQueue.length) {
+      const id = jobQueue.shift();
+      const job = jobs.get(id) || (await loadJob(id));
+      if (!job || job.status === "done" || job.status === "error") continue;
+      // cancelled while waiting
+      if (job.status === "cancelled") continue;
+      currentJobId = id;
+      try {
+        // Always warm agent before a turn so replies don't die on cold start
+        if (!agent.sessionId) {
+          try {
+            await agent.start();
+          } catch (e) {
+            console.error("[queue] agent start failed:", e.message);
+            try {
+              await agent.reset();
+            } catch {
+              /* ignore */
+            }
+          }
+        }
+        await runJob(job);
+        // Guarantee terminal status so phone poll always exits
+        if (job.status === "running" || job.status === "queued") {
+          job.status = job.reply ? "done" : "error";
+          if (!job.reply) {
+            job.reply =
+              "Error: job ended without a reply. Please send again.";
+            job.error = job.error || "no terminal status";
+          }
+          job.finishedAt = new Date().toISOString();
+          job.updatedAt = job.finishedAt;
+          await persistJob(job);
+        }
+      } catch (e) {
+        console.error("[queue] runJob threw", e);
+        job.status = "error";
+        job.error = e instanceof Error ? e.message : String(e);
+        job.reply =
+          (job.reply ? job.reply + "\n\n" : "") +
+          `Error: ${job.error}\n\n_(Send again — this should not happen.)_`;
+        job.finishedAt = new Date().toISOString();
+        job.updatedAt = job.finishedAt;
+        await persistJob(job);
+      } finally {
+        currentJobId = null;
+      }
+    }
+  } finally {
+    queueRunning = false;
+    currentJobId = null;
+  }
+}
+
+async function cancelJob(id) {
+  const job = await loadJob(id);
+  if (!job) return null;
+  if (job.status === "done" || job.status === "error" || job.status === "cancelled") {
+    return job;
+  }
+  // remove from queue if waiting
+  const idx = jobQueue.indexOf(id);
+  if (idx >= 0) jobQueue.splice(idx, 1);
+
+  job.status = "cancelled";
+  job.error = "cancelled";
+  job.reply = job.reply || "_(cancelled)_";
+  job.finishedAt = new Date().toISOString();
+  job.updatedAt = job.finishedAt;
+  await persistJob(job);
+
+  // if this job is the hung running one, kill agent so queue can continue
+  if (currentJobId === id) {
+    await agent.reset();
+    // mark any other stuck "running" as cancelled (orphans after crash)
+    for (const [jid, j] of jobs) {
+      if (j.status === "running" && jid !== id) {
+        j.status = "error";
+        j.error = "interrupted by reset";
+        j.finishedAt = new Date().toISOString();
+        j.updatedAt = j.finishedAt;
+        await persistJob(j);
+      }
+    }
+    currentJobId = null;
+    queueRunning = false;
+    void processQueue();
+  }
+  return job;
+}
+
+async function resetAll() {
+  // cancel everything pending
+  jobQueue.length = 0;
+  for (const [, job] of jobs) {
+    if (job.status === "queued" || job.status === "running") {
+      job.status = "cancelled";
+      job.error = "reset";
+      job.reply = job.reply || "_(reset)_";
+      job.finishedAt = new Date().toISOString();
+      job.updatedAt = job.finishedAt;
+      await persistJob(job);
+    }
+  }
+  currentJobId = null;
+  queueRunning = false;
+  await agent.reset();
+  return {
+    ok: true,
+    sessionId: agent.sessionId,
+    cwd: CWD,
+  };
+}
+
+/**
+ * POST /api/chat — enqueue on Mac, return immediately (phone may lock).
+ */
+async function handleChat(req, res) {
+  if (!authOk(req)) return sendJson(res, 401, { error: "unauthorized" });
+  let body;
+  try {
+    body = JSON.parse((await readBody(req)).toString("utf8"));
+  } catch {
+    return sendJson(res, 400, { error: "invalid json" });
+  }
+  const text = String(body.text || "").trim();
+  const images = Array.isArray(body.images) ? body.images : [];
+  if (!text && !images.length) {
+    return sendJson(res, 400, { error: "empty message" });
+  }
+
+  const imagePaths = [];
+  for (const img of images.slice(0, 6)) {
+    const b64 = String(img.data || img.base64 || "").replace(
+      /^data:[^;]+;base64,/,
+      ""
+    );
+    if (!b64 || b64.length < 32) continue;
+    const mime = String(img.mimeType || img.type || "image/jpeg");
+    const ext = mime.includes("png")
+      ? "png"
+      : mime.includes("webp")
+        ? "webp"
+        : "jpg";
+    const path = join(
+      INBOX,
+      `${Date.now()}-${randomUUID().slice(0, 8)}.${ext}`
+    );
+    await writeFile(path, Buffer.from(b64, "base64"));
+    imagePaths.push(path);
+  }
+
+  const id = randomUUID();
+  const now = new Date().toISOString();
+  const job = {
+    id,
+    status: "queued",
+    text,
+    imagePaths,
+    createdAt: now,
+    updatedAt: now,
+    startedAt: null,
+    finishedAt: null,
+    reply: "",
+    tools: [],
+    error: null,
+    sessionId: null,
+  };
+  // Only "queued" if something is already running or waiting — otherwise start now.
+  const mustWait = queueRunning || jobQueue.length > 0;
+  const queuePosition = mustWait ? jobQueue.length + 1 : 0;
+  if (!mustWait) {
+    job.status = "running"; // will be set again in runJob; avoids false "queued" flash
+  }
+  jobs.set(id, job);
+  jobQueue.push(id);
+  await persistJob(job);
+  void processQueue();
+
+  sendJson(res, 202, {
+    jobId: id,
+    status: mustWait ? "queued" : "running",
+    queuePosition,
+    cwd: CWD,
+  });
+}
+
+async function handleJobGet(req, res, id) {
+  if (!authOk(req)) return sendJson(res, 401, { error: "unauthorized" });
+  const job = await loadJob(id);
+  if (!job) return sendJson(res, 404, { error: "job not found" });
+  sendJson(res, 200, publicJob(job));
+}
+
+async function handleJobsList(req, res) {
+  if (!authOk(req)) return sendJson(res, 401, { error: "unauthorized" });
+  const list = [...jobs.values()]
+    .sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1))
+    .slice(0, 40)
+    .map(publicJob);
+  sendJson(res, 200, {
+    jobs: list,
+    queueLength: jobQueue.length,
+    processing: queueRunning,
+  });
+}
+
+async function handleStatus(req, res) {
+  if (!authOk(req)) return sendJson(res, 401, { error: "unauthorized" });
+  sendJson(res, 200, {
+    ok: true,
+    cwd: CWD,
+    sessionId: agent.sessionId,
+    agentReady: !!agent.sessionId,
+    queueLength: jobQueue.length,
+    processing: queueRunning,
+    currentJobId,
+  });
+}
+
+/** POST /api/reset — kill agent + cancel all jobs (phone unstick). */
+async function handleReset(req, res) {
+  if (!authOk(req)) return sendJson(res, 401, { error: "unauthorized" });
+  try {
+    const out = await resetAll();
+    sendJson(res, 200, out);
+  } catch (e) {
+    sendJson(res, 500, {
+      error: e instanceof Error ? e.message : String(e),
+    });
+  }
+}
+
+/** POST /api/jobs/:id/cancel */
+async function handleJobCancel(req, res, id) {
+  if (!authOk(req)) return sendJson(res, 401, { error: "unauthorized" });
+  const job = await cancelJob(id);
+  if (!job) return sendJson(res, 404, { error: "job not found" });
+  sendJson(res, 200, publicJob(job));
+}
+
+/** GET /api/jobs/:id/media/:index — serve a generated image for the phone UI. */
+async function handleJobMedia(req, res, id, indexStr) {
+  if (!authOk(req)) return sendJson(res, 401, { error: "unauthorized" });
+  const job = await loadJob(id);
+  if (!job) return sendJson(res, 404, { error: "job not found" });
+  const imgs = Array.isArray(job.replyImages) ? job.replyImages : [];
+  const index = Number(indexStr);
+  if (!Number.isInteger(index) || index < 0 || index >= imgs.length) {
+    return sendJson(res, 404, { error: "image not found" });
+  }
+  const abs = resolve(String(imgs[index]));
+  if (!isAllowedMediaPath(abs) || !existsSync(abs)) {
+    return sendJson(res, 404, { error: "image file missing" });
+  }
+  const ext = extname(abs).toLowerCase();
+  const mime =
+    ext === ".png"
+      ? "image/png"
+      : ext === ".webp"
+        ? "image/webp"
+        : ext === ".gif"
+          ? "image/gif"
+          : ext === ".tif" || ext === ".tiff"
+            ? "image/tiff"
+            : "image/jpeg";
+  try {
+    const st = statSync(abs);
+    res.writeHead(200, {
+      "Content-Type": mime,
+      "Content-Length": st.size,
+      "Cache-Control": "private, max-age=3600",
+      "Access-Control-Allow-Origin": "*",
+    });
+    createReadStream(abs).pipe(res);
+  } catch (e) {
+    sendJson(res, 500, { error: e.message || String(e) });
+  }
+}
+
+/** Grok TUI / CLI slash commands (shown under `/` on phone). */
+const CLI_SLASH_CATALOG = [
+  { id: "cli-usage", slash: "/usage", label: "Usage", description: "Live credit usage (instant, no agent)", insert: "/usage", kind: "cli" },
+  { id: "cli-cost", slash: "/cost", label: "Cost", description: "Alias for /usage (instant)", insert: "/cost", kind: "cli" },
+  { id: "cli-session-info", slash: "/session-info", label: "Session info", description: "Auth, model, turns, context (aliases /status /info)", insert: "/session-info", kind: "cli" },
+  { id: "cli-status", slash: "/status", label: "Status", description: "Alias for /session-info", insert: "/status", kind: "cli" },
+  { id: "cli-info", slash: "/info", label: "Info", description: "Alias for /session-info", insert: "/info", kind: "cli" },
+  { id: "cli-context", slash: "/context", label: "Context", description: "Context window breakdown", insert: "/context", kind: "cli" },
+  { id: "cli-compact", slash: "/compact", label: "Compact", description: "Compress conversation history", insert: "/compact ", kind: "cli" },
+  { id: "cli-new", slash: "/new", label: "New session", description: "Start a fresh session (alias /clear)", insert: "/new", kind: "cli" },
+  { id: "cli-clear", slash: "/clear", label: "Clear", description: "Alias for /new", insert: "/clear", kind: "cli" },
+  { id: "cli-rename", slash: "/rename", label: "Rename", description: "Rename session (alias /title)", insert: "/rename ", kind: "cli" },
+  { id: "cli-export", slash: "/export", label: "Export", description: "Export conversation", insert: "/export", kind: "cli" },
+  { id: "cli-copy", slash: "/copy", label: "Copy", description: "Copy last reply", insert: "/copy", kind: "cli" },
+  { id: "cli-model", slash: "/model", label: "Model", description: "Switch model (alias /m)", insert: "/model ", kind: "cli" },
+  { id: "cli-effort", slash: "/effort", label: "Effort", description: "Set reasoning effort", insert: "/effort ", kind: "cli" },
+  { id: "cli-plan", slash: "/plan", label: "Plan mode", description: "Enter plan mode", insert: "/plan ", kind: "cli" },
+  { id: "cli-view-plan", slash: "/view-plan", label: "View plan", description: "Preview saved plan", insert: "/view-plan", kind: "cli" },
+  { id: "cli-always-approve", slash: "/always-approve", label: "Always approve", description: "Toggle yolo permissions", insert: "/always-approve", kind: "cli" },
+  { id: "cli-auto", slash: "/auto", label: "Auto mode", description: "Toggle auto permission mode", insert: "/auto", kind: "cli" },
+  { id: "cli-skills", slash: "/skills", label: "Skills", description: "Browse skills", insert: "/skills", kind: "cli" },
+  { id: "cli-mcps", slash: "/mcps", label: "MCPs", description: "List MCP servers", insert: "/mcps", kind: "cli" },
+  { id: "cli-plugins", slash: "/plugins", label: "Plugins", description: "Manage plugins", insert: "/plugins", kind: "cli" },
+  { id: "cli-hooks", slash: "/hooks", label: "Hooks", description: "Manage hooks", insert: "/hooks", kind: "cli" },
+  { id: "cli-doctor", slash: "/doctor", label: "Doctor", description: "Diagnostics", insert: "/doctor", kind: "cli" },
+  { id: "cli-docs", slash: "/docs", label: "Docs", description: "Open documentation", insert: "/docs", kind: "cli" },
+  { id: "cli-release-notes", slash: "/release-notes", label: "Release notes", description: "What's new", insert: "/release-notes", kind: "cli" },
+  { id: "cli-feedback", slash: "/feedback", label: "Feedback", description: "Send feedback", insert: "/feedback ", kind: "cli" },
+  { id: "cli-privacy", slash: "/privacy", label: "Privacy", description: "Data retention / training settings", insert: "/privacy", kind: "cli" },
+  { id: "cli-settings", slash: "/settings", label: "Settings", description: "Open settings (aliases /config /prefs)", insert: "/settings", kind: "cli" },
+  { id: "cli-login", slash: "/login", label: "Login", description: "Authenticate", insert: "/login", kind: "cli" },
+  { id: "cli-logout", slash: "/logout", label: "Logout", description: "Sign out", insert: "/logout", kind: "cli" },
+  { id: "cli-memory", slash: "/memory", label: "Memory", description: "Browse memory (alias /mem)", insert: "/memory", kind: "cli" },
+  { id: "cli-remember", slash: "/remember", label: "Remember", description: "Save a note to memory", insert: "/remember ", kind: "cli" },
+  { id: "cli-flush", slash: "/flush", label: "Flush memory", description: "Save session knowledge now", insert: "/flush", kind: "cli" },
+  { id: "cli-dream", slash: "/dream", label: "Dream", description: "Consolidate memory", insert: "/dream", kind: "cli" },
+  { id: "cli-imagine", slash: "/imagine", label: "Imagine", description: "CLI image generation command", insert: "/imagine ", kind: "cli" },
+  { id: "cli-imagine-video", slash: "/imagine-video", label: "Imagine video", description: "CLI video generation", insert: "/imagine-video ", kind: "cli" },
+  { id: "cli-deep-research", slash: "/deep-research", label: "Deep research", description: "Deep research workflow", insert: "/deep-research ", kind: "cli" },
+  { id: "cli-workflow", slash: "/workflow", label: "Workflow", description: "Workflow commands", insert: "/workflow ", kind: "cli" },
+  { id: "cli-workflows", slash: "/workflows", label: "Workflows dashboard", description: "Live workflow runs", insert: "/workflows", kind: "cli" },
+  { id: "cli-goal", slash: "/goal", label: "Goal", description: "Goal harness commands", insert: "/goal ", kind: "cli" },
+  { id: "cli-loop", slash: "/loop", label: "Loop", description: "Recurring prompt loop", insert: "/loop ", kind: "cli" },
+  { id: "cli-help", slash: "/help", label: "Help", description: "List phone + CLI commands", insert: "/help", kind: "cli" },
+];
+
+/** Built-in agent tools (tool-loop capabilities). */
+const AGENT_TOOL_CATALOG = [
+  { id: "run_terminal_command", slash: "/tool-shell", label: "Tool: Shell", description: "run_terminal_command", insert: "Use run_terminal_command to: ", kind: "tool" },
+  { id: "read_file", slash: "/tool-read", label: "Tool: Read file", description: "read_file", insert: "Use read_file on: ", kind: "tool" },
+  { id: "write", slash: "/tool-write", label: "Tool: Write file", description: "write", insert: "Use write to create/overwrite: ", kind: "tool" },
+  { id: "search_replace", slash: "/tool-edit", label: "Tool: Edit file", description: "search_replace", insert: "Use search_replace to edit: ", kind: "tool" },
+  { id: "grep", slash: "/tool-grep", label: "Tool: Grep", description: "grep", insert: "Use grep to find: ", kind: "tool" },
+  { id: "list_dir", slash: "/tool-ls", label: "Tool: List dir", description: "list_dir", insert: "Use list_dir on: ", kind: "tool" },
+  { id: "todo_write", slash: "/tool-todo", label: "Tool: Todos", description: "todo_write", insert: "Use todo_write to track: ", kind: "tool" },
+  { id: "spawn_subagent", slash: "/tool-agent", label: "Tool: Subagent", description: "spawn_subagent", insert: "Use spawn_subagent to: ", kind: "tool" },
+  { id: "get_command_or_subagent_output", slash: "/tool-task-out", label: "Tool: Task output", description: "get_command_or_subagent_output", insert: "Use get_command_or_subagent_output for: ", kind: "tool" },
+  { id: "kill_command_or_subagent", slash: "/tool-kill", label: "Tool: Kill task", description: "kill_command_or_subagent", insert: "Use kill_command_or_subagent on: ", kind: "tool" },
+  { id: "monitor", slash: "/tool-monitor", label: "Tool: Monitor", description: "monitor", insert: "Use monitor to watch: ", kind: "tool" },
+  { id: "scheduler_create", slash: "/tool-schedule", label: "Tool: Schedule", description: "scheduler_create", insert: "Use scheduler_create to: ", kind: "tool" },
+  { id: "scheduler_list", slash: "/tool-schedules", label: "Tool: List schedules", description: "scheduler_list", insert: "Use scheduler_list and summarize.", kind: "tool" },
+  { id: "scheduler_delete", slash: "/tool-unschedule", label: "Tool: Delete schedule", description: "scheduler_delete", insert: "Use scheduler_delete for id: ", kind: "tool" },
+  { id: "web_search", slash: "/tool-search", label: "Tool: Web search", description: "web_search", insert: "Use web_search for: ", kind: "tool" },
+  { id: "web_fetch", slash: "/tool-fetch", label: "Tool: Fetch URL", description: "web_fetch", insert: "Use web_fetch on: ", kind: "tool" },
+  { id: "open_page", slash: "/tool-page", label: "Tool: Open page", description: "open_page", insert: "Use open_page on: ", kind: "tool" },
+  { id: "open_page_with_find", slash: "/tool-page-find", label: "Tool: Page find", description: "open_page_with_find", insert: "Use open_page_with_find on: ", kind: "tool" },
+  { id: "x_user_search", slash: "/tool-x-user", label: "Tool: X user", description: "x_user_search", insert: "Use x_user_search for: ", kind: "tool" },
+  { id: "x_semantic_search", slash: "/tool-x-sem", label: "Tool: X semantic", description: "x_semantic_search", insert: "Use x_semantic_search for: ", kind: "tool" },
+  { id: "x_keyword_search", slash: "/tool-x", label: "Tool: X keyword", description: "x_keyword_search", insert: "Use x_keyword_search for: ", kind: "tool" },
+  { id: "x_thread_fetch", slash: "/tool-x-thread", label: "Tool: X thread", description: "x_thread_fetch", insert: "Use x_thread_fetch for post_id: ", kind: "tool" },
+  { id: "image_gen", slash: "/tool-imagine", label: "Tool: Image gen", description: "image_gen", insert: "Use image_gen to create: ", kind: "tool" },
+  { id: "image_edit", slash: "/tool-img-edit", label: "Tool: Image edit", description: "image_edit", insert: "Use image_edit on the attached image: ", kind: "tool" },
+  { id: "image_to_video", slash: "/tool-i2v", label: "Tool: Image→video", description: "image_to_video", insert: "Use image_to_video on: ", kind: "tool" },
+  { id: "reference_to_video", slash: "/tool-ref2v", label: "Tool: Refs→video", description: "reference_to_video", insert: "Use reference_to_video with images: ", kind: "tool" },
+  { id: "enter_plan_mode", slash: "/tool-plan", label: "Tool: Enter plan", description: "enter_plan_mode", insert: "Use enter_plan_mode, then plan: ", kind: "tool" },
+  { id: "exit_plan_mode", slash: "/tool-plan-exit", label: "Tool: Exit plan", description: "exit_plan_mode", insert: "Use exit_plan_mode when the plan is ready.", kind: "tool" },
+  { id: "ask_user_question", slash: "/tool-ask", label: "Tool: Ask me", description: "ask_user_question", insert: "Use ask_user_question to ask me: ", kind: "tool" },
+  { id: "search_tool", slash: "/tool-mcp-search", label: "Tool: MCP search", description: "search_tool", insert: "Use search_tool to find MCP tools for: ", kind: "tool" },
+  { id: "use_tool", slash: "/tool-mcp", label: "Tool: MCP call", description: "use_tool", insert: "Use use_tool for: ", kind: "tool" },
+  { id: "workflow", slash: "/tool-workflow", label: "Tool: Workflow", description: "workflow", insert: "Use workflow to run: ", kind: "tool" },
+];
+
+function fullCatalog() {
+  return [...CLI_SLASH_CATALOG, ...AGENT_TOOL_CATALOG];
+}
+
+/**
+ * Handle phone-local slash commands without the agent when possible.
+ * Returns markdown string or null to fall through to agent.
+ */
+async function tryLocalSlashCommand(text) {
+  const line = String(text || "").trim();
+  if (!line.startsWith("/")) return null;
+  const parts = line.split(/\s+/);
+  const cmd = parts[0].toLowerCase();
+  const arg = parts.slice(1).join(" ").trim();
+
+  if (cmd === "/help" || cmd === "/commands") {
+    const cli = CLI_SLASH_CATALOG.map((c) => `- \`${c.slash}\` — ${c.description}`).join("\n");
+    const tools = AGENT_TOOL_CATALOG.map((c) => `- \`${c.slash}\` — ${c.description}`).join("\n");
+    return `## Commands\n\n### CLI\n${cli}\n\n### Agent tools\n${tools}\n\nType \`/\` in the composer to search.`;
+  }
+
+  if (cmd === "/session-info" || cmd === "/status" || cmd === "/info") {
+    return [
+      "## Session info (phone bridge)",
+      "",
+      `- **cwd:** \`${CWD}\``,
+      `- **agent session:** \`${agent.sessionId || "(starting)"}\``,
+      `- **queue:** ${jobQueue.length} waiting, processing=${queueRunning}`,
+      `- **jobs dir:** \`${JOBS_DIR}\``,
+      "",
+      "This is the phone-bridge agent, not the TUI session on your Mac desktop.",
+    ].join("\n");
+  }
+
+  if (cmd === "/context") {
+    return [
+      "## Context",
+      "",
+      `- Workspace: \`${CWD}\``,
+      `- Agent tools and MCP servers are available in this process.`,
+      `- Phone history is stored on your device; Mac jobs are in \`${JOBS_DIR}\`.`,
+      "",
+      "For a full token breakdown like the TUI `/context`, ask me to estimate usage or open the TUI.",
+    ].join("\n");
+  }
+
+  if (cmd === "/usage" || cmd === "/cost") {
+    // Handled earlier via isUsageIntent — keep as safety net
+    return formatUsageReport();
+  }
+
+  if (cmd === "/new" || cmd === "/clear") {
+    await agent.reset();
+    return [
+      "## New session",
+      "",
+      `- Fresh agent session: \`${agent.sessionId || "(starting)"}\``,
+      `- cwd: \`${CWD}\``,
+      "",
+      "Phone chat history on your device is unchanged. Mac agent context was reset.",
+    ].join("\n");
+  }
+
+  if (cmd === "/mcps") {
+    return null; // agent can list via tools
+  }
+
+  if (cmd === "/doctor") {
+    return null;
+  }
+
+  // TUI-only UI commands — explain
+  const tuiOnly = new Set([
+    "/dashboard",
+    "/agents-dashboard",
+    "/sessions",
+    "/resume",
+    "/home",
+    "/welcome",
+    "/quit",
+    "/exit",
+    "/delete",
+    "/fork",
+    "/rewind",
+    "/undo",
+    "/edit-prompt",
+    "/multiline",
+    "/ml",
+    "/history",
+    "/compact-mode",
+    "/vim-mode",
+    "/minimal",
+    "/fullscreen",
+    "/full",
+    "/theme",
+    "/timestamps",
+    "/settings",
+    "/config",
+    "/preferences",
+    "/prefs",
+    "/privacy",
+    "/login",
+    "/logout",
+    "/tutorial",
+    "/btw",
+  ]);
+  if (tuiOnly.has(cmd)) {
+    return [
+      `\`${cmd}\` is a **TUI-only** command (desktop Grok Build UI).`,
+      "",
+      "On phone you can use agent tools via `/tool-*` or just ask in plain language.",
+      "For billing/usage try **`/usage`** (instant — does not use the agent).",
+      arg ? `\n(You also passed: ${arg})` : "",
+    ].join("\n");
+  }
+
+  return null;
+}
+
+/**
+ * Map some slashes to agent instructions. Prefer sending native ACP slash
+ * commands as-is when the agent implements them (/session-info works).
+ * Never expand /usage — that is handled locally.
+ */
+function expandSlashForAgent(text) {
+  const line = String(text || "").trim();
+  const m = line.match(/^(\/[^\s]+)(?:\s+(.*))?$/s);
+  if (!m) return text;
+  const cmd = m[1].toLowerCase();
+  const arg = (m[2] || "").trim();
+
+  // Native agent slash commands — send raw so slash_exec can answer instantly
+  const nativePassThrough = new Set([
+    "/session-info",
+    "/status",
+    "/info",
+    "/context",
+    "/compact",
+    "/always-approve",
+    "/deep-research",
+    "/workflow",
+    "/goal",
+  ]);
+  if (nativePassThrough.has(cmd)) {
+    return line;
+  }
+
+  if (cmd === "/doctor") {
+    return "The user ran /doctor. Run diagnostics on the environment (node, git, grok auth if possible) and summarize health.";
+  }
+  if (cmd === "/mcps") {
+    return "The user ran /mcps. List connected MCP servers and notable tools (use search_tool as needed).";
+  }
+  if (cmd === "/skills") {
+    return "The user ran /skills. List available skills under ~/.grok/skills, bundled skills, and project .grok/skills.";
+  }
+  if (cmd === "/imagine") {
+    return arg
+      ? `Use image_gen to generate an image: ${arg}`
+      : "Ask what image to generate, then use image_gen.";
+  }
+  if (cmd === "/imagine-video") {
+    return arg
+      ? `Plan and generate a video (image_gen + image_to_video as needed): ${arg}`
+      : "Ask what video to generate.";
+  }
+  if (cmd === "/remember") {
+    return arg
+      ? `Remember this for future sessions (note it clearly): ${arg}`
+      : "Ask what I should remember.";
+  }
+  if (cmd === "/model" || cmd === "/m") {
+    return arg
+      ? `Note: user requested model switch to ${arg}. Explain how to switch models in TUI (/model) and continue with current model unless you can switch.`
+      : "Explain current model and how /model works in the TUI.";
+  }
+  if (cmd === "/plan") {
+    return arg
+      ? `Enter planning mindset (enter_plan_mode if useful) and plan: ${arg}`
+      : "Enter plan mode / draft a plan for the next task — ask what to plan if unclear.";
+  }
+  // Unknown slash → still send to agent as explicit command
+  if (line.startsWith("/")) {
+    return `The user invoked slash command: ${line}\nHandle it if you can, or explain how it works in Grok Build.`;
+  }
+  return text;
+}
+
+async function handleTools(req, res) {
+  if (!authOk(req)) return sendJson(res, 401, { error: "unauthorized" });
+  const tools = fullCatalog();
+  sendJson(res, 200, {
+    cwd: CWD,
+    tools,
+    counts: {
+      cli: CLI_SLASH_CATALOG.length,
+      agentTools: AGENT_TOOL_CATALOG.length,
+      total: tools.length,
+    },
+  });
+}
+
+function serveStatic(req, res) {
+  let path = (req.url || "/").split("?")[0];
+  if (path === "/") path = "/index.html";
+  const file = join(PUBLIC, path.replace(/\.\./g, ""));
+  if (!file.startsWith(PUBLIC) || !existsSync(file)) {
+    res.writeHead(404);
+    res.end("Not found");
+    return;
+  }
+  const ext = extname(file);
+  res.writeHead(200, { "Content-Type": MIME[ext] || "application/octet-stream" });
+  createReadStream(file).pipe(res);
+}
+
+const server = http.createServer(async (req, res) => {
+  if (req.method === "OPTIONS") {
+    res.writeHead(204, {
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
+      "Access-Control-Allow-Headers": "Authorization, Content-Type",
+    });
+    res.end();
+    return;
+  }
+  const url = req.url || "/";
+  const pathOnly = url.split("?")[0];
+  try {
+    if (req.method === "POST" && pathOnly === "/api/chat") {
+      return await handleChat(req, res);
+    }
+    if (req.method === "POST" && pathOnly === "/api/reset") {
+      return await handleReset(req, res);
+    }
+    if (req.method === "GET" && pathOnly === "/api/status") {
+      return await handleStatus(req, res);
+    }
+    if (req.method === "GET" && pathOnly === "/api/tools") {
+      return await handleTools(req, res);
+    }
+    if (req.method === "GET" && pathOnly === "/api/jobs") {
+      return await handleJobsList(req, res);
+    }
+    const jobCancel = pathOnly.match(
+      /^\/api\/jobs\/([a-f0-9-]+)\/cancel$/i
+    );
+    if (req.method === "POST" && jobCancel) {
+      return await handleJobCancel(req, res, jobCancel[1]);
+    }
+    const jobMedia = pathOnly.match(
+      /^\/api\/jobs\/([a-f0-9-]+)\/media\/(\d+)$/i
+    );
+    if (req.method === "GET" && jobMedia) {
+      return await handleJobMedia(req, res, jobMedia[1], jobMedia[2]);
+    }
+    const jobMatch = pathOnly.match(/^\/api\/jobs\/([a-f0-9-]+)$/i);
+    if (req.method === "GET" && jobMatch) {
+      return await handleJobGet(req, res, jobMatch[1]);
+    }
+    return serveStatic(req, res);
+  } catch (e) {
+    console.error(e);
+    if (!res.headersSent) sendJson(res, 500, { error: String(e.message || e) });
+  }
+});
+
+server.listen(PORT, HOST, () => {
+  console.log(`
+grok-phone-pwa listening on http://${HOST}:${PORT}
+  cwd:    ${CWD}
+  inbox:  ${INBOX}
+  secret: (PHONE_CHAT_SECRET set)
+
+On your phone (same Wi‑Fi or Tailscale):
+  1. Open http://<this-mac-ip>:${PORT}
+  2. Enter the secret once
+  3. Share → Add to Home Screen (Safari) for installable PWA
+
+Keep this process running while you chat.
+`);
+});

@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1, viewport-fit=cover"
+    />
+    <meta name="theme-color" content="#000000" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="Grok" />
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <link rel="apple-touch-icon" href="/icon-192.png" />
+    <link rel="stylesheet" href="/styles.css?v=15" />
+    <title>Grok</title>
+    <script src="/marked.min.js"></script>
+    <script src="/purify.min.js"></script>
+  </head>
+  <body>
+    <header>
+      <h1>Grok</h1>
+      <div class="header-right">
+        <button type="button" id="reset-btn" class="header-btn" title="Reset agent if stuck">
+          Reset
+        </button>
+        <div id="conn" class="status">offline</div>
+      </div>
+    </header>
+
+    <section id="gate">
+      <p>
+        Chat with the Grok Build agent running on your Mac. Enter the
+        <code>PHONE_CHAT_SECRET</code> from the Mac server, then add this page to
+        your Home Screen.
+      </p>
+      <input
+        id="secret"
+        type="password"
+        autocomplete="current-password"
+        placeholder="Shared secret"
+        enterkeyhint="go"
+      />
+      <button id="unlock" type="button">Connect</button>
+      <p style="font-size: 12px; margin-top: 8px">
+        Tip: same Wi‑Fi or Tailscale. Mac must be running
+        <code>npm start</code> in <code>grok-phone-pwa</code>.
+      </p>
+    </section>
+
+    <section id="chat">
+      <div id="messages"></div>
+      <div id="composer">
+        <div id="slash-menu" class="slash-menu hidden" role="listbox" aria-label="Tools"></div>
+        <div id="previews"></div>
+        <div class="row">
+          <button class="icon-btn" id="attach" type="button" title="Attach" aria-label="Attach photo">
+            ＋
+          </button>
+          <!-- Library (no capture) -->
+          <input id="file-library" type="file" accept="image/*" multiple class="hidden" />
+          <!-- Camera -->
+          <input id="file-camera" type="file" accept="image/*" capture="environment" class="hidden" />
+          <textarea
+            id="input"
+            rows="1"
+            placeholder="Message Grok…  (/ for tools)"
+            enterkeyhint="send"
+          ></textarea>
+          <button class="icon-btn primary" id="send" type="button" aria-label="Send">↑</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- Attach sheet: library vs camera -->
+    <div id="attach-sheet" class="sheet hidden" aria-hidden="true">
+      <div class="sheet-backdrop" id="attach-backdrop"></div>
+      <div class="sheet-panel" role="dialog" aria-label="Add photo">
+        <button type="button" id="pick-library" class="sheet-btn">Photo library</button>
+        <button type="button" id="pick-camera" class="sheet-btn">Take photo</button>
+        <button type="button" id="attach-cancel" class="sheet-btn sheet-cancel">Cancel</button>
+      </div>
+    </div>
+
+    <script src="/app.js?v=15" defer></script>
+  </body>
+</html>

@@ -1,0 +1,34 @@
+# Secrets & env
+.env
+.env.*
+!.env.example
+*.secret
+phone-chat-secret
+
+# Dependencies
+node_modules/
+
+# Logs & local runtime state (never commit)
+*.log
+logs/
+.phone-jobs/
+.phone-inbox/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*~
+
+# Local launchd / install copies (use docs templates only)
+*.plist
+!examples/*.plist.example
+
+# Test / coverage artifacts
+coverage/
+.nyc_output/
+scratch/
+tmp/
+*.tmp

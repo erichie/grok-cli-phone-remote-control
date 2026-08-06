@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Optional macOS LaunchAgent template.
+  1. Copy to ~/Library/LaunchAgents/com.example.grok-phone-pwa.plist
+  2. Replace every REPLACE_* value
+  3. launchctl load ~/Library/LaunchAgents/com.example.grok-phone-pwa.plist
+
+  Do NOT commit a filled-in copy.
+-->
+<plist version="1.0">
+  <dict>
+    <key>Label</key>
+    <string>com.example.grok-phone-pwa</string>
+    <key>ProgramArguments</key>
+    <array>
+      <string>REPLACE_PATH_TO_NODE</string>
+      <string>REPLACE_PATH_TO_REPO/server.mjs</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>REPLACE_PATH_TO_REPO</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+      <key>PHONE_CHAT_SECRET</key>
+      <string>REPLACE_WITH_LONG_RANDOM_SECRET</string>
+      <key>PHONE_CHAT_CWD</key>
+      <string>REPLACE_PATH_TO_WORKSPACE</string>
+      <key>PATH</key>
+      <string>/usr/local/bin:/usr/bin:/bin:REPLACE_PATH_TO_GROK_BIN_DIR</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>REPLACE_HOME/.grok/logs/phone-pwa.log</string>
+    <key>StandardErrorPath</key>
+    <string>REPLACE_HOME/.grok/logs/phone-pwa.log</string>
+  </dict>
+</plist>
