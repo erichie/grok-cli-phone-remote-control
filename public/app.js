@@ -3,6 +3,7 @@ const $ = (id) => document.getElementById(id);
 const gate = $("gate");
 const chat = $("chat");
 const messages = $("messages");
+const scrollBottomBtn = $("scroll-bottom-btn");
 const connEl = $("conn");
 const resetBtn = $("reset-btn");
 const secretInput = $("secret");
@@ -87,8 +88,72 @@ function setThinking(thinkingEl, opts = {}) {
   thinkingEl.innerHTML = parts.join("");
 }
 
-function scrollBottom() {
+/**
+ * Auto-scroll only while the user is near the bottom so they can read older
+ * messages while a reply is streaming. Jump-to-bottom button when scrolled up.
+ */
+const NEAR_BOTTOM_PX = 80;
+/** @type {boolean} stick follow mode — false after the user scrolls up */
+let stickToBottom = true;
+
+function distanceFromBottom() {
+  if (!messages) return 0;
+  return (
+    messages.scrollHeight - messages.scrollTop - messages.clientHeight
+  );
+}
+
+function isNearBottom() {
+  return distanceFromBottom() <= NEAR_BOTTOM_PX;
+}
+
+function updateScrollBottomBtn() {
+  if (!scrollBottomBtn || !messages) return;
+  const hasOverflow =
+    messages.scrollHeight > messages.clientHeight + 8;
+  const show = hasOverflow && !isNearBottom();
+  scrollBottomBtn.classList.toggle("hidden", !show);
+  scrollBottomBtn.setAttribute("aria-hidden", show ? "false" : "true");
+}
+
+/**
+ * @param {{ force?: boolean }} [opts]
+ *   force: always jump (send, history load, jump button)
+ *   otherwise only if stickToBottom (user is following the live stream)
+ */
+function scrollBottom(opts = {}) {
+  if (!messages) return;
+  const force = opts.force === true;
+  if (!force && !stickToBottom) {
+    updateScrollBottomBtn();
+    return;
+  }
   messages.scrollTop = messages.scrollHeight;
+  stickToBottom = true;
+  updateScrollBottomBtn();
+}
+
+function onMessagesScroll() {
+  stickToBottom = isNearBottom();
+  updateScrollBottomBtn();
+}
+
+if (messages) {
+  messages.addEventListener("scroll", onMessagesScroll, { passive: true });
+  // Content growth while scrolled up should refresh the jump button
+  if (typeof ResizeObserver !== "undefined") {
+    const ro = new ResizeObserver(() => {
+      if (stickToBottom) scrollBottom();
+      else updateScrollBottomBtn();
+    });
+    ro.observe(messages);
+  }
+}
+
+if (scrollBottomBtn) {
+  scrollBottomBtn.addEventListener("click", () => {
+    scrollBottom({ force: true });
+  });
 }
 
 /** Configure marked once (UMD global from marked.min.js). */
@@ -316,7 +381,8 @@ function addMsg(role, text, opts = {}) {
   }
 
   messages.appendChild(el);
-  scrollBottom();
+  // New user messages pin to bottom; bot stream only follows if user is already there
+  scrollBottom({ force: role === "user" || opts.forceScroll === true });
 
   if (persist) {
     const entry = {
@@ -560,7 +626,7 @@ function renderHistory() {
       startJobPoll(m.jobId, body, thinkingEl);
     }
   }
-  scrollBottom();
+  scrollBottom({ force: true });
 }
 
 /**
@@ -1070,8 +1136,11 @@ async function send() {
   const { body, thinkingEl } = addMsg("bot", "", {
     showThinking: true,
     jobStatus: "running",
+    forceScroll: true,
   });
   setThinking(thinkingEl, { phase: "Sending…" });
+  // Always jump to the new turn when the user sends (even if they were scrolled up)
+  scrollBottom({ force: true });
 
   try {
     const res = await fetch("/api/chat", {

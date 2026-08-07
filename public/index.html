@@ -12,7 +12,7 @@
     <meta name="apple-mobile-web-app-title" content="Grok" />
     <link rel="manifest" href="/manifest.webmanifest" />
     <link rel="apple-touch-icon" href="/icon-192.png" />
-    <link rel="stylesheet" href="/styles.css?v=17" />
+    <link rel="stylesheet" href="/styles.css?v=19" />
     <title>Grok</title>
     <script src="/marked.min.js"></script>
     <script src="/purify.min.js"></script>
@@ -49,7 +49,19 @@
     </section>
 
     <section id="chat">
-      <div id="messages"></div>
+      <div id="messages-wrap">
+        <div id="messages"></div>
+        <button
+          type="button"
+          id="scroll-bottom-btn"
+          class="scroll-bottom-btn hidden"
+          aria-label="Scroll to bottom"
+          title="Scroll to bottom"
+          aria-hidden="true"
+        >
+          ↓
+        </button>
+      </div>
       <div id="composer">
         <div id="slash-menu" class="slash-menu hidden" role="listbox" aria-label="Tools"></div>
         <div id="previews"></div>
@@ -82,6 +94,6 @@
       </div>
     </div>
 
-    <script src="/app.js?v=17" defer></script>
+    <script src="/app.js?v=19" defer></script>
   </body>
 </html>

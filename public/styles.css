@@ -169,6 +169,15 @@ header .status.bad {
   display: flex;
 }
 
+/* Messages column + floating jump-to-bottom control */
+#messages-wrap {
+  flex: 1;
+  min-height: 0;
+  position: relative;
+  display: flex;
+  flex-direction: column;
+}
+
 #messages {
   flex: 1;
   overflow-y: auto;
@@ -177,6 +186,41 @@ header .status.bad {
   flex-direction: column;
   gap: 20px;
   -webkit-overflow-scrolling: touch;
+  overscroll-behavior: contain;
+}
+
+/* Shown when the user has scrolled up and there is more content below */
+.scroll-bottom-btn {
+  position: absolute;
+  right: 16px;
+  bottom: 14px;
+  z-index: 6;
+  width: 40px;
+  height: 40px;
+  border-radius: 999px;
+  border: 1px solid #333;
+  background: rgba(18, 18, 18, 0.92);
+  color: #fff;
+  font-size: 18px;
+  font-weight: 600;
+  line-height: 1;
+  cursor: pointer;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.45);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  touch-action: manipulation;
+}
+
+.scroll-bottom-btn:active {
+  background: #222;
+  transform: scale(0.96);
+}
+
+.scroll-bottom-btn.hidden {
+  display: none;
 }
 
 /* ── Messages ───────────────────────────────────────────── */
