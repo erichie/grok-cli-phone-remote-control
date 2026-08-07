@@ -1,13 +1,13 @@
 {
-  "name": "grok-phone-pwa",
+  "name": "grok-cli-phone-remote-control",
   "version": "0.1.0",
   "private": true,
-  "description": "Installable phone PWA that chats with a local Grok Build agent on your computer (ACP stdio bridge)",
+  "description": "Installable phone PWA remote control for your local Grok CLI / Build agent (ACP stdio bridge)",
   "license": "MIT",
   "type": "module",
   "repository": {
     "type": "git",
-    "url": "https://github.com/erichie/grok-phone-pwa.git"
+    "url": "https://github.com/erichie/grok-cli-phone-remote-control.git"
   },
   "scripts": {
     "start": "node server.mjs",

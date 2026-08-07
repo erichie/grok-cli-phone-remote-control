@@ -463,7 +463,7 @@ class GrokAcp {
 
     const init = await this.request("initialize", {
       protocolVersion: "1",
-      clientInfo: { name: "grok-phone-pwa", version: "0.1.0" },
+      clientInfo: { name: "grok-cli-phone-remote-control", version: "0.1.0" },
       clientCapabilities: {
         fs: { readTextFile: true, writeTextFile: true },
         terminal: true,
@@ -2582,7 +2582,7 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(PORT, HOST, () => {
   console.log(`
-grok-phone-pwa listening on http://${HOST}:${PORT}
+grok-cli-phone-remote-control listening on http://${HOST}:${PORT}
   cwd:    ${CWD}
   inbox:  ${INBOX}
   secret: (PHONE_CHAT_SECRET set)

@@ -1,6 +1,6 @@
-# Grok Phone PWA
+# Grok CLI Phone Remote Control
 
-Installable **phone chat UI** that talks to a **local [Grok Build](https://x.ai) agent** on your computer (full tools, your workspace). Supports photos, slash commands, durable job queue (phone can lock), usage lookup, and inline Imagine images.
+Installable **phone remote-control PWA** for your **local [Grok CLI](https://x.ai) / Grok Build agent** (full tools, your workspace). Supports photos, slash commands, durable job queue (phone can lock), usage lookup, session reconnect, and inline Imagine images.
 
 This is **not** a mirror of an open TUI session. It starts its own ACP process:
 
@@ -26,8 +26,8 @@ grok agent --always-approve stdio
 ### 1. Clone and configure
 
 ```bash
-git clone https://github.com/erichie/grok-phone-pwa.git
-cd grok-phone-pwa
+git clone https://github.com/erichie/grok-cli-phone-remote-control.git
+cd grok-cli-phone-remote-control
 
 # Required: long random shared secret (phone + server must match)
 export PHONE_CHAT_SECRET="$(openssl rand -hex 24)"
@@ -50,7 +50,7 @@ npm start
 You should see something like:
 
 ```text
-grok-phone-pwa listening on http://0.0.0.0:8787
+grok-cli-phone-remote-control listening on http://0.0.0.0:8787
 ```
 
 Leave this process running (and keep the machine awake while you chat).

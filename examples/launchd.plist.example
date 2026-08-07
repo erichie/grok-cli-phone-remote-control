@@ -2,16 +2,16 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
   Optional macOS LaunchAgent template.
-  1. Copy to ~/Library/LaunchAgents/com.example.grok-phone-pwa.plist
+  1. Copy to ~/Library/LaunchAgents/com.example.grok-cli-phone-remote.plist
   2. Replace every REPLACE_* value
-  3. launchctl load ~/Library/LaunchAgents/com.example.grok-phone-pwa.plist
+  3. launchctl load ~/Library/LaunchAgents/com.example.grok-cli-phone-remote.plist
 
   Do NOT commit a filled-in copy.
 -->
 <plist version="1.0">
   <dict>
     <key>Label</key>
-    <string>com.example.grok-phone-pwa</string>
+    <string>com.example.grok-cli-phone-remote</string>
     <key>ProgramArguments</key>
     <array>
       <string>REPLACE_PATH_TO_NODE</string>
