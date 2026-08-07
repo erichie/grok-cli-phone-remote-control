@@ -24,7 +24,7 @@ import { readFile, writeFile, mkdir, readdir, stat, rename } from "node:fs/promi
 import { join, extname, dirname, resolve, basename } from "node:path";
 import { fileURLToPath } from "node:url";
 import { homedir, tmpdir } from "node:os";
-import { randomUUID } from "node:crypto";
+import { randomUUID, timingSafeEqual } from "node:crypto";
 import { createInterface } from "node:readline";
 import {
   applySessionUpdate,
@@ -32,8 +32,23 @@ import {
   forceTerminalizeJob,
   isTerminalJobStatus,
 } from "./lib/job-stream.mjs";
+import {
+  isJobSealed,
+  sealJob,
+  isShortFollowUp,
+  buildRecentContextBlock,
+} from "./lib/job-ownership.mjs";
+import {
+  emptyConversation,
+  loadConversation,
+  saveConversation,
+  upsertJobInConversation,
+  conversationToMessages,
+  rebuildConversationFromJobs,
+  buildTranscriptPromptContext,
+} from "./lib/conversation.mjs";
 import { TerminalManager } from "./lib/terminal-manager.mjs";
-import { defaultAllowedRoots } from "./lib/fs-handlers.mjs";
+import { defaultAllowedRoots, isPathAllowed } from "./lib/fs-handlers.mjs";
 import { AcpLineHandler } from "./lib/acp-line-handler.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -48,6 +63,8 @@ const CWD =
 const GROK_BIN = process.env.GROK_BIN || "grok";
 const INBOX = join(homedir(), ".grok", "phone-inbox");
 const JOBS_DIR = join(homedir(), ".grok", "phone-jobs");
+/** Durable conversation transcript + last ACP session id (survives bridge restart). */
+const CONVERSATION_PATH = join(homedir(), ".grok", "phone-conversation.json");
 const AUTH_PATH = join(homedir(), ".grok", "auth.json");
 /** Live credit/usage (same source as TUI /usage). */
 const BILLING_CREDITS_URL =
@@ -56,13 +73,17 @@ const BILLING_MONTHLY_URL = "https://cli-chat-proxy.grok.com/v1/billing";
 const USER_SUB_URL =
   "https://cli-chat-proxy.grok.com/v1/user?include=subscription";
 /**
- * Progress silence: no tool/message chunks for this long → treat as hung and recover.
- * (Thought-only streams also count as progress so long reasoning is allowed.)
- * Absolute max wall time still applies.
+ * Progress silence: no *message/tool* chunks for this long → treat as hung and recover.
+ * Thought-only streams do NOT reset the idle timer (high-effort reasoning can stream forever).
+ * Absolute max wall time still applies. Override with PHONE_CHAT_JOB_IDLE_TIMEOUT_MS.
  */
-/** No user-visible message/tool progress for this long → hang recovery. */
+/** No user-visible message/tool progress for this long → hang recovery (default 90s). */
 const JOB_IDLE_TIMEOUT_MS = Number(
   process.env.PHONE_CHAT_JOB_IDLE_TIMEOUT_MS || 90 * 1000
+);
+/** Max JSON/body size for chat uploads (images base64 included). */
+const MAX_BODY_BYTES = Number(
+  process.env.PHONE_CHAT_MAX_BODY_BYTES || 12 * 1024 * 1024
 );
 const JOB_MAX_TIMEOUT_MS = Number(
   process.env.PHONE_CHAT_JOB_TIMEOUT_MS || 45 * 60 * 1000
@@ -304,11 +325,26 @@ class GrokAcp {
     this.rl = null;
     this.nextId = 1;
     this.sessionId = null;
+    /** True when live session came from session/load (reconnect). */
+    this.sessionResumed = false;
+    this.loadSessionSupported = false;
+    /** Durable ACP session id to reload after process death. */
+    this.preferredSessionId = null;
     this.listeners = new Set();
     this.ready = null;
     /** Handles agent→client terminal/* requests (required when terminal:true). */
     this.terminals = new TerminalManager();
-    this.allowedRoots = defaultAllowedRoots(cwd);
+    const extraRoots = (process.env.PHONE_CHAT_FS_ROOTS || "")
+      .split(/[:;,]/)
+      .map((s) => s.trim())
+      .filter(Boolean);
+    this.allowedRoots = defaultAllowedRoots(cwd, {
+      // Full home is powerful (agent can read/write almost anything) — opt-in.
+      allowHome:
+        process.env.PHONE_CHAT_ALLOW_HOME === "1" ||
+        process.env.PHONE_CHAT_ALLOW_HOME === "true",
+      extraRoots,
+    });
     /** Shared demux + agent-request answers (same code path unit tests drive). */
     this.lineHandler = new AcpLineHandler({
       terminals: this.terminals,
@@ -365,6 +401,7 @@ class GrokAcp {
     this.proc = null;
     this.ready = null;
     this.sessionId = null;
+    this.sessionResumed = false;
     this.nextId = 1;
     if (proc && !proc.killed) {
       try {
@@ -382,14 +419,22 @@ class GrokAcp {
     }
   }
 
-  /** Stop + start a fresh agent session (phone Reset). */
-  async reset() {
+  /**
+   * Stop + start. By default keeps preferredSessionId so the next start can
+   * session/load the same conversation (reconnect without losing agent memory).
+   * @param {{ fresh?: boolean }} [opts] fresh=true drops preferred session (phone Reset)
+   */
+  async reset(opts = {}) {
+    if (opts.fresh) {
+      this.preferredSessionId = null;
+    }
     await this.stop();
     await new Promise((r) => setTimeout(r, 400));
     return this.start();
   }
 
   async _start() {
+    this.sessionResumed = false;
     this.proc = spawn(
       GROK_BIN,
       ["agent", "--always-approve", "stdio"],
@@ -406,7 +451,9 @@ class GrokAcp {
     this.proc.on("exit", (code) => {
       console.error(`[agent] exited code=${code}`);
       this.ready = null;
+      // Keep preferredSessionId so a later start() can session/load
       this.sessionId = null;
+      this.sessionResumed = false;
       this.lineHandler.clearPending("agent process exited");
       void this.terminals.releaseAll().catch(() => {});
     });
@@ -414,7 +461,7 @@ class GrokAcp {
     this.rl = createInterface({ input: this.proc.stdout });
     this.rl.on("line", (line) => this._onLine(line));
 
-    await this.request("initialize", {
+    const init = await this.request("initialize", {
       protocolVersion: "1",
       clientInfo: { name: "grok-phone-pwa", version: "0.1.0" },
       clientCapabilities: {
@@ -422,6 +469,34 @@ class GrokAcp {
         terminal: true,
       },
     });
+    this.loadSessionSupported = !!(
+      init?.agentCapabilities?.loadSession ||
+      init?.agentCapabilities?.load_session
+    );
+
+    // Prefer reloading the durable ACP session (same conversation as remote apps)
+    const wantId = this.preferredSessionId;
+    if (wantId && this.loadSessionSupported) {
+      try {
+        const loaded = await this.request("session/load", {
+          sessionId: wantId,
+          cwd: this.cwd,
+          mcpServers: [],
+        });
+        this.sessionId =
+          loaded.sessionId || loaded.session_id || wantId;
+        this.sessionResumed = true;
+        this.preferredSessionId = this.sessionId;
+        console.log(
+          `[agent] session/load ok ${this.sessionId} cwd=${this.cwd}`
+        );
+        return;
+      } catch (e) {
+        console.warn(
+          `[agent] session/load failed (${e.message}); falling back to session/new`
+        );
+      }
+    }
 
     const sess = await this.request("session/new", {
       cwd: this.cwd,
@@ -429,10 +504,12 @@ class GrokAcp {
       _meta: { yoloMode: true },
     });
     this.sessionId = sess.sessionId || sess.session_id;
+    this.sessionResumed = false;
     if (!this.sessionId) {
       throw new Error("session/new did not return sessionId: " + JSON.stringify(sess));
     }
-    console.log(`[agent] session ${this.sessionId} cwd=${this.cwd}`);
+    this.preferredSessionId = this.sessionId;
+    console.log(`[agent] session/new ${this.sessionId} cwd=${this.cwd}`);
   }
 
   /** Demux entry — delegates to AcpLineHandler (shared with unit tests). */
@@ -540,10 +617,61 @@ class GrokAcp {
 }
 
 const agent = new GrokAcp(CWD);
-// warm start + recover jobs left "running" after last crash/restart
-recoverJobsOnStartup()
-  .then(() => agent.start())
-  .catch((e) => console.error("[agent] start failed:", e.message));
+/** @type {import('./lib/conversation.mjs').ConversationState} */
+let conversation = emptyConversation();
+
+async function persistConversation() {
+  try {
+    if (agent.sessionId) conversation.acpSessionId = agent.sessionId;
+    await saveConversation(CONVERSATION_PATH, conversation);
+  } catch (e) {
+    console.warn("[conversation] save failed", e.message);
+  }
+}
+
+async function rememberJobInConversation(job) {
+  if (!job?.id) return;
+  upsertJobInConversation(conversation, job);
+  if (job.sessionId) {
+    conversation.acpSessionId = job.sessionId;
+    agent.preferredSessionId = job.sessionId;
+  } else if (agent.sessionId) {
+    conversation.acpSessionId = agent.sessionId;
+    agent.preferredSessionId = agent.sessionId;
+  }
+  await persistConversation();
+}
+
+// warm start: durable conversation + recover jobs + resume ACP session
+(async () => {
+  try {
+    conversation = await loadConversation(CONVERSATION_PATH);
+    conversation = await rebuildConversationFromJobs(JOBS_DIR, conversation);
+    if (conversation.acpSessionId) {
+      agent.preferredSessionId = conversation.acpSessionId;
+    }
+    await saveConversation(CONVERSATION_PATH, conversation);
+    console.log(
+      `[conversation] id=${conversation.conversationId} turns=${conversation.turns.length} acp=${conversation.acpSessionId || "(none)"}`
+    );
+  } catch (e) {
+    console.warn("[conversation] bootstrap failed", e.message);
+  }
+  try {
+    await recoverJobsOnStartup();
+  } catch (e) {
+    console.error("[jobs] recovery failed:", e.message);
+  }
+  try {
+    await agent.start();
+    if (agent.sessionId) {
+      conversation.acpSessionId = agent.sessionId;
+      await persistConversation();
+    }
+  } catch (e) {
+    console.error("[agent] start failed:", e.message);
+  }
+})();
 // every 15s: unstick jobs that claim running but aren't being processed
 setInterval(() => {
   void sweepOrphanJobs();
@@ -562,11 +690,23 @@ const MIME = {
   ".ico": "image/x-icon",
 };
 
+function secretsEqual(a, b) {
+  if (typeof a !== "string" || typeof b !== "string") return false;
+  const ba = Buffer.from(a);
+  const bb = Buffer.from(b);
+  if (ba.length !== bb.length) return false;
+  try {
+    return timingSafeEqual(ba, bb);
+  } catch {
+    return false;
+  }
+}
+
 function authOk(req) {
   const h = req.headers.authorization || "";
-  if (h === `Bearer ${SECRET}`) return true;
+  if (h.startsWith("Bearer ") && secretsEqual(h.slice(7), SECRET)) return true;
   const url = new URL(req.url || "/", `http://${req.headers.host}`);
-  if (url.searchParams.get("token") === SECRET) return true;
+  if (secretsEqual(url.searchParams.get("token") || "", SECRET)) return true;
   return false;
 }
 
@@ -578,9 +718,18 @@ function sendJson(res, code, obj) {
   res.end(JSON.stringify(obj));
 }
 
-async function readBody(req) {
+async function readBody(req, maxBytes = MAX_BODY_BYTES) {
   const chunks = [];
-  for await (const c of req) chunks.push(c);
+  let total = 0;
+  for await (const c of req) {
+    total += c.length;
+    if (total > maxBytes) {
+      const err = new Error(`request body too large (max ${maxBytes} bytes)`);
+      err.code = "BODY_TOO_LARGE";
+      throw err;
+    }
+    chunks.push(c);
+  }
   return Buffer.concat(chunks);
 }
 
@@ -925,16 +1074,13 @@ function appendImageMarkdown(job) {
 
 function isAllowedMediaPath(absPath) {
   if (!absPath || typeof absPath !== "string") return false;
-  const resolved = resolve(absPath);
   const allowedRoots = [
     resolve(join(homedir(), ".grok")),
     resolve(INBOX),
     resolve(tmpdir()),
     resolve(CWD),
   ];
-  return allowedRoots.some(
-    (root) => resolved === root || resolved.startsWith(root + "/")
-  );
+  return isPathAllowed(absPath, allowedRoots);
 }
 
 /** Serialize disk writes per job so concurrent stream updates never corrupt JSON. */
@@ -994,13 +1140,20 @@ async function persistJob(job) {
     .catch(() => {})
     .then(async () => {
       // snapshot fields for a consistent write
-      const snapshot = JSON.stringify(jobs.get(id) || job);
+      const live = jobs.get(id) || job;
+      const snapshot = JSON.stringify(live);
       const dest = jobPath(id);
       const tmp = dest + `.${process.pid}.${Date.now()}.tmp`;
       await writeFile(tmp, snapshot, "utf8");
       await rename(tmp, dest);
       // Push live update to any phone SSE listeners
-      notifyJobSubscribers(jobs.get(id) || job);
+      notifyJobSubscribers(live);
+      // Durable conversation transcript for reconnect (host-backed history)
+      try {
+        await rememberJobInConversation(live);
+      } catch (e) {
+        console.warn("[conversation] upsert failed", e.message);
+      }
     })
     .catch((e) => {
       console.warn("[jobs] persist failed", id, e.message);
@@ -1203,10 +1356,13 @@ async function runAgentTurn(job, promptText, opts = {}) {
     await agent.prompt(
       { text: promptText, imagePaths: job.imagePaths || [] },
       (ev) => {
+        // Cancel / Stop & show sealed the job — ignore further stream chunks
+        if (isJobSealed(job)) return;
         job.updatedAt = new Date().toISOString();
         if (ev.type === "update") {
           // Production progressive path — same function unit tests drive
           const applied = applySessionUpdate(job, ev.update || {});
+          if (applied.sealed) return;
           if (applied.progressed) markProgress();
           if (applied.imageContent) {
             collectImagesFromUpdate(job, {
@@ -1222,7 +1378,7 @@ async function runAgentTurn(job, promptText, opts = {}) {
           applyPromptDone(job, ev.result);
         }
         // persist often so phone always has latest partial/final text + SSE push
-        void persistJob(job);
+        if (!isJobSealed(job)) void persistJob(job);
       }
     );
 
@@ -1267,8 +1423,67 @@ async function runAgentTurn(job, promptText, opts = {}) {
   }
 }
 
+/**
+ * Recent finished jobs (memory + disk) for short follow-up context.
+ * @param {string} excludeId
+ * @param {number} limit
+ */
+async function loadRecentFinishedJobs(excludeId, limit = 4) {
+  const out = [];
+  const seen = new Set();
+  const consider = (j) => {
+    if (!j?.id || j.id === excludeId || seen.has(j.id)) return;
+    if (!isTerminalJobStatus(j.status)) return;
+    seen.add(j.id);
+    out.push(j);
+  };
+  // In-memory first (newest-ish by updatedAt)
+  const mem = [...jobs.values()].sort((a, b) =>
+    String(b.updatedAt || b.createdAt || "").localeCompare(
+      String(a.updatedAt || a.createdAt || "")
+    )
+  );
+  for (const j of mem) {
+    consider(j);
+    if (out.length >= limit) return out;
+  }
+  try {
+    const files = await readdir(JOBS_DIR);
+    const jsons = files
+      .filter((f) => f.endsWith(".json"))
+      .map((f) => join(JOBS_DIR, f));
+    const stats = await Promise.all(
+      jsons.map(async (p) => {
+        try {
+          const s = await stat(p);
+          return { p, m: s.mtimeMs };
+        } catch {
+          return null;
+        }
+      })
+    );
+    stats
+      .filter(Boolean)
+      .sort((a, b) => b.m - a.m)
+      .slice(0, 12)
+      .forEach((x) => {});
+    for (const row of stats.filter(Boolean).sort((a, b) => b.m - a.m).slice(0, 12)) {
+      try {
+        const raw = await readFile(row.p, "utf8");
+        consider(JSON.parse(raw));
+      } catch {
+        /* ignore */
+      }
+      if (out.length >= limit) break;
+    }
+  } catch {
+    /* ignore */
+  }
+  return out.slice(0, limit);
+}
+
 async function runJob(job) {
-  if (job.userFinalized) return; // phone already Stop & show'd
+  if (isJobSealed(job)) return; // phone already Stop & show / cancel'd
   job.status = "running";
   job.startedAt = job.startedAt || new Date().toISOString();
   job.updatedAt = new Date().toISOString();
@@ -1327,10 +1542,43 @@ async function runJob(job) {
   }
 
   let promptText = expandSlashForAgent(job.text);
+  // Multi-turn continuity when ACP session is brand-new (not session/load):
+  // inject durable transcript so reconnect / agent process death still has prior text.
+  // Always inject for short follow-ups ("yes please") even if session was loaded —
+  // load may not replay tool-side history the model needs for confirmations.
+  const needTranscript =
+    !agent.sessionResumed || isShortFollowUp(job.text);
+  if (needTranscript) {
+    try {
+      const fromConv = buildTranscriptPromptContext(
+        conversation.turns,
+        job.id,
+        10
+      );
+      if (fromConv) {
+        promptText = `${fromConv}\n\nUser's latest message: ${job.text.trim()}`;
+        console.log(
+          `[jobs] ${job.id} injected durable transcript (resumed=${!!agent.sessionResumed})`
+        );
+      } else if (isShortFollowUp(job.text)) {
+        const recent = await loadRecentFinishedJobs(job.id, 3);
+        const ctx = buildRecentContextBlock(recent, job.id, 2);
+        if (ctx) {
+          promptText = `${ctx}\n\nUser's latest message: ${job.text.trim()}`;
+          console.log(
+            `[jobs] ${job.id} injected prior-job context for short follow-up`
+          );
+        }
+      }
+    } catch (e) {
+      console.warn("[jobs] context inject failed", e.message);
+    }
+  }
   let lastResult = { ok: false, timedOut: false, idleTimedOut: false, error: "not started" };
   const maxAttempts = 1 + Math.max(0, JOB_AUTO_RETRIES);
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    if (isJobSealed(job)) return;
     job.attempts = attempt;
     job.status = "running";
     job.error = null;
@@ -1362,8 +1610,8 @@ async function runJob(job) {
 
     lastResult = await runAgentTurn(job, promptText, { attempt });
 
-    // Phone tapped "Stop & show" while we were working
-    if (job.userFinalized) return;
+    // Phone tapped "Stop & show" / cancel while we were working
+    if (isJobSealed(job)) return;
 
     if (lastResult.ok) {
       // Success — but if we only got a pre-tool ack and tools ran, treat as incomplete
@@ -1382,6 +1630,7 @@ async function runJob(job) {
         if (attempt < maxAttempts) continue;
         break; // exhaust agent attempts → headless fallback below
       }
+      if (isJobSealed(job)) return;
       job.status = "done";
       job.error = null;
       if (!job.reply && !(job.replyImages || []).length) {
@@ -1422,7 +1671,7 @@ async function runJob(job) {
     await new Promise((r) => setTimeout(r, 800));
   }
 
-  if (job.userFinalized) return;
+  if (isJobSealed(job)) return;
 
   // Agent path failed — headless one-shot so the phone ALWAYS gets a finished reply.
   // Kill any wedged long-lived ACP session first (unanswered terminal/* / stuck
@@ -1442,6 +1691,8 @@ async function runJob(job) {
       console.warn("[jobs] agent stop before headless failed", e.message);
     }
 
+    if (isJobSealed(job)) return;
+
     job.tools = job.tools || [];
     job.tools.push({
       name: "headless_fallback",
@@ -1451,8 +1702,13 @@ async function runJob(job) {
     job.updatedAt = new Date().toISOString();
     await persistJob(job);
     const partial = (job.reply || "").trim();
+    // Prefer injected context for short follow-ups; always keep partial reply
+    let fallbackBase = promptText;
+    if (!isShortFollowUp(job.text)) {
+      fallbackBase = expandSlashForAgent(job.text);
+    }
     const fallbackPrompt = [
-      expandSlashForAgent(job.text),
+      fallbackBase,
       "",
       "IMPORTANT: Give a complete final answer. Do not only say you will look — actually answer.",
       partial
@@ -1466,6 +1722,8 @@ async function runJob(job) {
       CWD,
       Math.min(JOB_MAX_TIMEOUT_MS, 4 * 60 * 1000)
     );
+    // Re-check after long await — user may have finalized mid-headless
+    if (isJobSealed(job)) return;
     job.reply = headlessReply;
     job.status = "done";
     job.error = null;
@@ -1481,6 +1739,7 @@ async function runJob(job) {
     await persistJob(job);
     return;
   } catch (e) {
+    if (isJobSealed(job)) return;
     const msg = e instanceof Error ? e.message : String(e);
     console.error(`[jobs] ${job.id} headless fallback failed:`, msg);
     forceTerminalizeJob(job, {
@@ -1526,10 +1785,7 @@ async function processQueue() {
         }
         await runJob(job);
         // Guarantee terminal status so phone poll always exits
-        if (
-          !job.userFinalized &&
-          !isTerminalJobStatus(job.status)
-        ) {
+        if (!isJobSealed(job)) {
           forceTerminalizeJob(job, {
             reason: job.error || "no terminal status",
             note: job.reply
@@ -1544,7 +1800,7 @@ async function processQueue() {
           await persistJob(job);
         }
       } catch (e) {
-        if (job.userFinalized) {
+        if (isJobSealed(job)) {
           /* phone already took ownership of the result */
         } else {
           console.error("[queue] runJob threw", e);
@@ -1568,6 +1824,33 @@ async function processQueue() {
 }
 
 /**
+ * Kill the agent for the active job without re-entering processQueue.
+ * The running processQueue loop owns the queue; after runJob returns
+ * (userFinalized / cancelled), it continues the while-loop naturally.
+ * Re-entering processQueue here used to set queueRunning=false while
+ * await runJob was still in flight → concurrent agent use.
+ */
+async function interruptActiveAgent(jobId) {
+  if (currentJobId !== jobId) return;
+  try {
+    await agent.cancel();
+  } catch {
+    /* ignore */
+  }
+  try {
+    await agent.reset();
+  } catch {
+    /* ignore */
+  }
+  // Do NOT clear queueRunning or call processQueue() — active loop resumes.
+  // Only kick the queue if no loop is currently driving it (stuck bookkeeping).
+  if (!queueRunning) {
+    currentJobId = null;
+    void processQueue();
+  }
+}
+
+/**
  * Phone "Stop & show" — end the job now with whatever reply we have so the UI unsticks.
  * Kills the agent if this is the active job so the queue can continue.
  */
@@ -1585,32 +1868,18 @@ async function finalizeJob(id) {
   if (idx >= 0) jobQueue.splice(idx, 1);
 
   const partial = (job.reply || "").trim();
-  job.userFinalized = true; // prevent runJob from overwriting after agent kill
-  job.status = partial ? "done" : "error";
-  job.error = partial ? null : "finalized with no reply";
-  job.reply = partial
-    ? partial +
-      "\n\n_(Stopped early — this is everything the Mac had so far.)_"
-    : "_(Stopped — no reply text yet. Send the question again.)_";
-  job.finishedAt = new Date().toISOString();
-  job.updatedAt = job.finishedAt;
+  // Critical: seal so runJob headless/success/stream cannot overwrite.
+  sealJob(job, {
+    status: partial ? "done" : "error",
+    error: partial ? null : "finalized with no reply",
+    reply: partial
+      ? partial +
+        "\n\n_(Stopped early — this is everything the Mac had so far.)_"
+      : "_(Stopped — no reply text yet. Send the question again.)_",
+  });
   await persistJob(job);
 
-  if (currentJobId === id) {
-    try {
-      await agent.cancel();
-    } catch {
-      /* ignore */
-    }
-    try {
-      await agent.reset();
-    } catch {
-      /* ignore */
-    }
-    currentJobId = null;
-    queueRunning = false;
-    void processQueue();
-  }
+  await interruptActiveAgent(id);
   return job;
 }
 
@@ -1624,38 +1893,38 @@ async function cancelJob(id) {
   const idx = jobQueue.indexOf(id);
   if (idx >= 0) jobQueue.splice(idx, 1);
 
-  job.status = "cancelled";
-  job.error = "cancelled";
-  job.reply = job.reply || "_(cancelled)_";
-  job.finishedAt = new Date().toISOString();
-  job.updatedAt = job.finishedAt;
+  // Critical: seal so runJob cannot headless-overwrite cancelled → done.
+  sealJob(job, {
+    status: "cancelled",
+    error: "cancelled",
+    reply: job.reply || "_(cancelled)_",
+  });
   await persistJob(job);
 
-  // if this job is the hung running one, kill agent so queue can continue
+  // if this job is the hung running one, kill agent so the active queue loop continues
   if (currentJobId === id) {
-    await agent.reset();
     // mark any other stuck "running" as cancelled (orphans after crash)
     for (const [jid, j] of jobs) {
       if (j.status === "running" && jid !== id) {
+        j.userFinalized = true;
         j.status = "error";
-        j.error = "interrupted by reset";
+        j.error = "interrupted by cancel";
         j.finishedAt = new Date().toISOString();
         j.updatedAt = j.finishedAt;
         await persistJob(j);
       }
     }
-    currentJobId = null;
-    queueRunning = false;
-    void processQueue();
+    await interruptActiveAgent(id);
   }
   return job;
 }
 
 async function resetAll() {
-  // cancel everything pending
+  // cancel everything pending — mark userFinalized so in-flight runJob cannot overwrite
   jobQueue.length = 0;
   for (const [, job] of jobs) {
     if (job.status === "queued" || job.status === "running") {
+      job.userFinalized = true;
       job.status = "cancelled";
       job.error = "reset";
       job.reply = job.reply || "_(reset)_";
@@ -1664,12 +1933,17 @@ async function resetAll() {
       await persistJob(job);
     }
   }
+  // Reset is a full stop: new ACP session (explicit user action).
+  // Keep durable transcript so the phone still reloads prior text on reconnect.
   currentJobId = null;
   queueRunning = false;
-  await agent.reset();
+  await agent.reset({ fresh: true });
+  conversation.acpSessionId = agent.sessionId || null;
+  await persistConversation();
   return {
     ok: true,
     sessionId: agent.sessionId,
+    conversationId: conversation.conversationId,
     cwd: CWD,
   };
 }
@@ -1682,7 +1956,10 @@ async function handleChat(req, res) {
   let body;
   try {
     body = JSON.parse((await readBody(req)).toString("utf8"));
-  } catch {
+  } catch (e) {
+    if (e && e.code === "BODY_TOO_LARGE") {
+      return sendJson(res, 413, { error: e.message });
+    }
     return sendJson(res, 400, { error: "invalid json" });
   }
   const text = String(body.text || "").trim();
@@ -1819,10 +2096,55 @@ async function handleStatus(req, res) {
     ok: true,
     cwd: CWD,
     sessionId: agent.sessionId,
+    sessionResumed: !!agent.sessionResumed,
+    conversationId: conversation.conversationId,
     agentReady: !!agent.sessionId,
     queueLength: jobQueue.length,
     processing: queueRunning,
     currentJobId,
+    turnCount: conversation.turns?.length || 0,
+  });
+}
+
+/**
+ * GET /api/conversation — host-backed transcript for phone reconnect.
+ * Always returns durable turns (from phone-conversation.json + jobs) so the
+ * UI reloads text even after bridge restart / localStorage wipe.
+ */
+async function handleConversation(req, res) {
+  if (!authOk(req)) return sendJson(res, 401, { error: "unauthorized" });
+  // Refresh from disk jobs so partial replies mid-turn are included
+  try {
+    conversation = await rebuildConversationFromJobs(JOBS_DIR, conversation);
+  } catch {
+    /* keep memory */
+  }
+  const messages = conversationToMessages(conversation, 80);
+  const activeJobs = [...jobs.values()]
+    .filter(
+      (j) =>
+        j.status === "running" ||
+        j.status === "queued" ||
+        // also surface very recent terminal jobs so reconnect can show final body
+        (isTerminalJobStatus(j.status) &&
+          Date.now() - (Date.parse(j.finishedAt || j.updatedAt || 0) || 0) <
+            10 * 60 * 1000)
+    )
+    .sort((a, b) =>
+      String(b.updatedAt || "").localeCompare(String(a.updatedAt || ""))
+    )
+    .slice(0, 20)
+    .map(publicJob);
+
+  sendJson(res, 200, {
+    conversationId: conversation.conversationId,
+    acpSessionId: agent.sessionId || conversation.acpSessionId,
+    sessionResumed: !!agent.sessionResumed,
+    messages,
+    turns: conversation.turns.slice(-80),
+    activeJobs,
+    currentJobId,
+    processing: queueRunning,
   });
 }
 
@@ -2213,6 +2535,9 @@ const server = http.createServer(async (req, res) => {
     }
     if (req.method === "GET" && pathOnly === "/api/status") {
       return await handleStatus(req, res);
+    }
+    if (req.method === "GET" && pathOnly === "/api/conversation") {
+      return await handleConversation(req, res);
     }
     if (req.method === "GET" && pathOnly === "/api/tools") {
       return await handleTools(req, res);

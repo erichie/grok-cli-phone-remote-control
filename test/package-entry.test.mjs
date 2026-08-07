@@ -20,6 +20,7 @@ test("PWA public assets exist", () => {
   for (const f of [
     "public/index.html",
     "public/app.js",
+    "public/history-merge.mjs",
     "public/styles.css",
     "public/sw.js",
     "public/manifest.webmanifest",

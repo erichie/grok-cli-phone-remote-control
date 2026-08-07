@@ -1,3 +1,8 @@
+import {
+  mergeHostHistory,
+  ensureActiveJobBotMessages,
+} from "./history-merge.mjs";
+
 const $ = (id) => document.getElementById(id);
 
 const gate = $("gate");
@@ -831,23 +836,44 @@ function stopJobPoll(jobId) {
   activePolls.delete(jobId);
 }
 
-// Resume polls when phone unlocks / tab visible again
-document.addEventListener("visibilitychange", () => {
-  if (document.visibilityState === "visible") {
-    for (const [jobId, p] of activePolls) {
-      clearInterval(p.timer);
-      activePolls.delete(jobId);
-      startJobPoll(jobId, p.bodyEl, p.thinkingEl);
+// Resume polls + refresh host transcript when phone unlocks / tab visible
+async function onForegroundResume() {
+  try {
+    const host = await loadHostConversation();
+    if (host?.messages?.length || host?.activeJobs?.length) {
+      let merged = mergeHostHistory(history, host.messages || [], MAX_HISTORY);
+      merged = ensureActiveJobBotMessages(merged, host.activeJobs || []);
+      const before = history
+        .map((m) => (m.text || "").length)
+        .reduce((a, b) => a + b, 0);
+      const after = merged
+        .map((m) => (m.text || "").length)
+        .reduce((a, b) => a + b, 0);
+      if (after > before || merged.length !== history.length) {
+        history = merged;
+        persistHistory();
+        renderHistory();
+      }
+      reattachActiveJobs(host.activeJobs || []);
     }
-    checkStatus();
+  } catch {
+    /* offline */
   }
-});
-window.addEventListener("focus", () => {
   for (const [jobId, p] of activePolls) {
     clearInterval(p.timer);
     activePolls.delete(jobId);
     startJobPoll(jobId, p.bodyEl, p.thinkingEl);
   }
+  checkStatus();
+}
+
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible") {
+    void onForegroundResume();
+  }
+});
+window.addEventListener("focus", () => {
+  void onForegroundResume();
 });
 
 function renderPreviews() {
@@ -906,10 +932,70 @@ async function checkStatus() {
   }
 }
 
-function showChat() {
+/**
+ * Load durable transcript + active jobs from the Mac (reconnect path).
+ * @returns {Promise<{ messages: Array, activeJobs: Array }|null>}
+ */
+async function loadHostConversation() {
+  const secret = getSecret();
+  if (!secret) return null;
+  try {
+    const res = await fetch("/api/conversation", {
+      headers: { Authorization: `Bearer ${secret}` },
+      cache: "no-store",
+    });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Re-subscribe to non-terminal Mac jobs (bot bubbles with thinking el).
+ * @param {Array} activeJobs
+ */
+function reattachActiveJobs(activeJobs) {
+  for (const job of activeJobs || []) {
+    if (
+      !job?.id ||
+      job.status === "done" ||
+      job.status === "error" ||
+      job.status === "cancelled"
+    ) {
+      continue;
+    }
+    if (activePolls.has(job.id)) continue;
+    // Must be the bot bubble — user bubble has same data-job-id, no thinking
+    const msgEl =
+      messages.querySelector(`.msg.bot[data-job-id="${job.id}"]`) ||
+      messages.querySelector(`.msg.bot[data-job-id='${job.id}']`);
+    const bodyEl = msgEl?.querySelector(".body");
+    const thinkingEl = msgEl?.querySelector(".thinking");
+    if (bodyEl && thinkingEl) {
+      startJobPoll(job.id, bodyEl, thinkingEl);
+    }
+  }
+}
+
+async function showChat() {
   gate.classList.add("hidden");
   chat.classList.add("active");
+  // Host-backed history first — like remote-control apps that always restore session text
+  const host = await loadHostConversation();
+  if (host?.messages?.length || host?.activeJobs?.length) {
+    let merged = mergeHostHistory(
+      loadHistory(),
+      host.messages || [],
+      MAX_HISTORY
+    );
+    // Guarantee bot rows for mid-flight jobs so poll can attach thinking UI
+    merged = ensureActiveJobBotMessages(merged, host.activeJobs || []);
+    history = merged;
+    persistHistory();
+  }
   renderHistory();
+  reattachActiveJobs(host?.activeJobs || []);
   checkStatus();
 }
 
@@ -924,7 +1010,7 @@ unlockBtn.onclick = async () => {
   setSecret(s);
   if (await checkStatus()) {
     await loadTools();
-    showChat();
+    await showChat();
   } else alert("Could not connect — check secret and that the Mac server is running.");
 };
 
@@ -1290,7 +1376,7 @@ if (getSecret()) {
   checkStatus().then(async (ok) => {
     if (ok) {
       await loadTools();
-      showChat();
+      await showChat();
     }
   });
 } else {

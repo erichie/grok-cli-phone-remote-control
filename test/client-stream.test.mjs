@@ -41,3 +41,18 @@ test("Get result / Stop & show recovery buttons present", () => {
   assert.match(appJs, /Stop & show/);
   assert.match(appJs, /\/finalize/);
 });
+
+test("client reloads host-backed conversation on unlock (not localStorage-only)", () => {
+  assert.match(appJs, /\/api\/conversation/);
+  assert.match(appJs, /loadHostConversation/);
+  assert.match(appJs, /mergeHostHistory/);
+  assert.match(appJs, /ensureActiveJobBotMessages/);
+  assert.match(appJs, /history-merge\.mjs/);
+  assert.match(appJs, /reattachActiveJobs/);
+  assert.match(appJs, /\.msg\.bot\[data-job-id/);
+  // showChat awaits host history before render
+  assert.match(appJs, /await loadHostConversation|loadHostConversation\(\)/);
+  assert.match(serverJs, /handleConversation|\/api\/conversation/);
+  assert.match(serverJs, /session\/load/);
+  assert.match(serverJs, /preferredSessionId|phone-conversation/);
+});

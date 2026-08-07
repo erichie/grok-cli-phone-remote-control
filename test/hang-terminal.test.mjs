@@ -15,10 +15,16 @@ import {
   TerminalManager,
   autoApprovePermission,
 } from "../lib/terminal-manager.mjs";
-import { readTextFile, writeTextFile, defaultAllowedRoots } from "../lib/fs-handlers.mjs";
+import {
+  readTextFile,
+  writeTextFile,
+  defaultAllowedRoots,
+  isPathAllowed,
+  resolvePathSafe,
+} from "../lib/fs-handlers.mjs";
 import { join } from "node:path";
-import { tmpdir } from "node:os";
-import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir, homedir } from "node:os";
+import { mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 
 test("hang watch detects idle after partial ack with no further progress", () => {
   let fakeNow = 1_000_000;
@@ -120,6 +126,59 @@ test("fs read/write handlers under allowed roots", async () => {
       () => readTextFile({ path: "/etc/passwd" }, roots),
       /not allowed/
     );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("defaultAllowedRoots excludes home unless allowHome", () => {
+  const dir = join(tmpdir(), "workspace-fake");
+  const narrow = defaultAllowedRoots(dir);
+  const home = resolvePathSafe(homedir());
+  // Home itself should not be a root by default (unless home === cwd, rare).
+  if (resolvePathSafe(dir) !== home) {
+    assert.equal(
+      narrow.some((r) => r === home),
+      false,
+      "home must not be an allowed root by default"
+    );
+  }
+  const wide = defaultAllowedRoots(dir, { allowHome: true });
+  assert.ok(wide.some((r) => r === home || home.startsWith(r + "/")));
+});
+
+test("isPathAllowed blocks symlink escape outside roots", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "phone-fs-sym-"));
+  try {
+    // Only the workspace root — not tmpdir/home — so a sibling path is outside.
+    const roots = [resolvePathSafe(dir)];
+    const outsideDir = await mkdtemp(join(tmpdir(), "phone-fs-out-"));
+    try {
+      const secret = join(outsideDir, "secret.txt");
+      await writeFile(secret, "classified", "utf8");
+      const link = join(dir, "escape-link");
+      await symlink(secret, link);
+      // Symlink path is under dir, but realpath points outside roots.
+      assert.equal(isPathAllowed(link, roots), false);
+      await assert.rejects(
+        () => readTextFile({ path: link }, roots),
+        /not allowed/
+      );
+    } finally {
+      await rm(outsideDir, { recursive: true, force: true });
+    }
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("isPathAllowed allows normal files under root", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "phone-fs-ok-"));
+  try {
+    const roots = defaultAllowedRoots(dir);
+    const path = join(dir, "ok.txt");
+    await writeFile(path, "ok", "utf8");
+    assert.equal(isPathAllowed(path, roots), true);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
