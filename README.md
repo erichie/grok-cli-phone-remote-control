@@ -17,7 +17,7 @@ grok agent --always-approve stdio
 | **Node.js 20+** | `node -v` |
 | **Grok CLI** | Installed and on `PATH` as `grok`, or set `GROK_BIN` |
 | **Grok login** | Run `grok login` once on the host machine |
-| **Phone + host network** | Same Wi‑Fi, [Tailscale](https://tailscale.com), or SSH tunnel |
+| **Phone + host network** | Same Wi‑Fi, or **[Tailscale](https://tailscale.com)** on both devices (recommended off-LAN) |
 
 ---
 
@@ -57,33 +57,34 @@ Leave this process running (and keep the machine awake while you chat).
 
 ### 3. Open on your phone
 
-1. Connect the phone to the **same network** as the host (LAN, Tailscale, or tunnel — see below).
-2. Find the host’s IP (System Settings → Network, `ipconfig getifaddr en0` on macOS, or your Tailscale IP).
-3. In Safari/Chrome open: `http://<host-ip>:8787`
+1. Put the phone and Mac on a network where they can reach each other:
+   - **Same Wi‑Fi**, or  
+   - **[Tailscale](https://tailscale.com) on both** (recommended when you’re not on the same LAN — devices talk over a private mesh).
+2. Find the host’s IP:
+   - LAN: System Settings → Network, or `ipconfig getifaddr en0` on macOS  
+   - Tailscale: Machine IP in the Tailscale app / admin console
+3. In Safari/Chrome open: `http://<host-ip>:8787` (use the **Tailscale IP** when using Tailscale).
 4. Enter the same `PHONE_CHAT_SECRET`.
 5. **Safari → Share → Add to Home Screen** for an installable PWA.
 
 ---
 
-## Remote access (recommended)
+## Remote access (recommended: Tailscale)
 
-### Tailscale
+So the phone and Mac can talk from anywhere without opening your home router:
 
-Install Tailscale on the host and phone, then open:
-
-```text
-http://<tailscale-ip>:8787
-```
-
-### SSH tunnel (e.g. Termius)
-
-Forward local port `8787` on the phone/client to `127.0.0.1:8787` on the host, then open:
+1. Install [Tailscale](https://tailscale.com) on the **Mac** and the **phone**, sign in to the same account/tailnet.
+2. On the Mac, note its **Tailscale IP** (e.g. `100.x.y.z`).
+3. Keep `npm start` (or the LaunchAgent) running on the Mac.
+4. On the phone open:
 
 ```text
-http://127.0.0.1:8787
+http://<mac-tailscale-ip>:8787
 ```
 
-**Do not** expose port `8787` to the public internet. This app is a LAN/Tailscale personal bridge, not a multi-tenant service.
+5. Enter `PHONE_CHAT_SECRET` once and add to Home Screen if you like.
+
+**Do not** expose port `8787` to the public internet. This app is a personal LAN / Tailscale bridge, not a multi-tenant service.
 
 ---
 
@@ -154,8 +155,8 @@ Note: **shell via `terminal/*` is still not chrooted.** Even with narrow fs root
 
 ### Network and auth notes
 
-- Prefer **Tailscale** or an **SSH tunnel**; avoid raw public port forwards
-- Default bind is `0.0.0.0` (LAN-reachable). Use `PHONE_CHAT_HOST=127.0.0.1` if you only tunnel
+- Prefer **Tailscale** (or same Wi‑Fi); avoid raw public port forwards
+- Default bind is `0.0.0.0` so the phone can reach the Mac on LAN or Tailscale
 - CORS is `*` — any origin can call the API **if** it has the secret (fine for a personal PWA; bad if the secret leaks via XSS or a screenshot)
 - Some routes accept `?token=` (SSE / images) so the secret can appear in server logs, browser history, and `Referer`. Prefer the `Authorization: Bearer` header when possible
 - Generate a long random secret (`openssl rand -hex 24` or better)
@@ -165,7 +166,7 @@ Note: **shell via `terminal/*` is still not chrooted.** Even with narrow fs root
 ### Operational hardening checklist
 
 1. Strong unique `PHONE_CHAT_SECRET`
-2. Tailscale or SSH tunnel (not open WAN)
+2. Tailscale on phone + Mac (or same Wi‑Fi — not open WAN)
 3. Dedicated `PHONE_CHAT_CWD` project folder
 4. Leave `PHONE_CHAT_ALLOW_HOME` unset unless you need it
 5. Keep the host machine locked / disk encrypted as usual
