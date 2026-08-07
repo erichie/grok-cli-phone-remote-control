@@ -1004,15 +1004,41 @@ function showGate() {
   gate.classList.remove("hidden");
 }
 
-unlockBtn.onclick = async () => {
-  const s = secretInput.value.trim();
-  if (!s) return;
+async function doUnlock() {
+  const s = (secretInput?.value || "").trim();
+  if (!s) {
+    alert("Paste the PHONE_CHAT_SECRET from the Mac first.");
+    return;
+  }
   setSecret(s);
-  if (await checkStatus()) {
-    await loadTools();
-    await showChat();
-  } else alert("Could not connect — check secret and that the Mac server is running.");
-};
+  setConn("connecting…", "");
+  try {
+    if (await checkStatus()) {
+      await loadTools();
+      await showChat();
+    } else {
+      alert(
+        "Could not connect — check the secret and that the Mac server is running."
+      );
+    }
+  } catch (e) {
+    setConn("offline", "bad");
+    alert(`Connect failed: ${e.message || e}`);
+  }
+}
+
+if (unlockBtn) {
+  unlockBtn.onclick = () => void doUnlock();
+}
+// Enter / Go on the secret field
+if (secretInput) {
+  secretInput.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      void doUnlock();
+    }
+  });
+}
 
 // ── Attach: library + camera ───────────────────────────────────────────────
 

@@ -682,6 +682,8 @@ setInterval(() => {
 const MIME = {
   ".html": "text/html; charset=utf-8",
   ".js": "application/javascript; charset=utf-8",
+  // Safari requires JS MIME for ES modules — octet-stream breaks import and kills the whole app.js
+  ".mjs": "application/javascript; charset=utf-8",
   ".css": "text/css; charset=utf-8",
   ".webmanifest": "application/manifest+json",
   ".json": "application/json",
