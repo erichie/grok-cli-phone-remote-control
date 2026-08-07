@@ -17,8 +17,19 @@ export function escapeHtml(s) {
  * @param {{ phase?: string, tools?: string, thought?: string }} opts
  * @returns {string}
  */
+/**
+ * Strip trailing "..." / "…" so we don't double up with animated dots.
+ * @param {string} phase
+ */
+export function stripTrailingEllipsis(phase) {
+  return String(phase || "")
+    .replace(/(?:\u2026|\.{2,})\s*$/u, "")
+    .trimEnd();
+}
+
 export function buildThinkingHtml(opts = {}) {
-  const phase = opts.phase || "Working…";
+  // Animated dots are the ellipsis — don't also put … on the label
+  const phase = stripTrailingEllipsis(opts.phase || "Working") || "Working";
   const tools = (opts.tools || "").trim();
   const thought = (opts.thought || "").trim();
   const parts = [];

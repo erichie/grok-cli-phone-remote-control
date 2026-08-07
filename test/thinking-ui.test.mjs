@@ -20,11 +20,20 @@ test("buildThinkingHtml includes breathing + dots animation hooks", () => {
   assert.match(html, /think-dots/);
   assert.match(html, /think-dot/);
   assert.match(html, /think-row/);
-  assert.match(html, /Thinking…|Thinking/);
+  assert.match(html, /Thinking/);
+  // No double ellipsis on the label — animated dots are the only "..."
+  assert.doesNotMatch(html, /think-breathe[^>]*>Thinking…/);
+  assert.doesNotMatch(html, /think-breathe[^>]*>Thinking\.\.\./);
   assert.match(html, /read_file/);
   assert.match(html, /planning next step/);
   // three dots
   assert.equal((html.match(/class="think-dot"/g) || []).length, 3);
+});
+
+test("buildThinkingHtml strips trailing ellipsis from phase", () => {
+  const html = buildThinkingHtml({ phase: "Working..." });
+  assert.match(html, />Working</);
+  assert.doesNotMatch(html, />Working\.\.\.</);
 });
 
 test("buildThinkingHtml escapes user-controlled phase/tools/thought", () => {

@@ -16,6 +16,8 @@ import {
   rebuildConversationFromJobs,
   buildTranscriptPromptContext,
   restoreAfterRestart,
+  startFreshConversation,
+  jobIsAfterClear,
 } from "../lib/conversation.mjs";
 
 test("session reconnect: prior assistant text survives restart seam", async () => {
@@ -75,6 +77,57 @@ test("transcript inject includes prior turns for cold ACP session", () => {
   assert.match(ctx, /Code review/i);
   assert.match(ctx, /cancel\/finalize/i);
   assert.match(ctx, /durable phone conversation/i);
+});
+
+test("startFreshConversation + rebuild ignores pre-clear jobs", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "phone-clear-"));
+  try {
+    const oldJob = {
+      id: "old-usage",
+      status: "done",
+      text: "/usage",
+      reply: "## Usage old",
+      createdAt: "2026-08-06T12:00:00.000Z",
+      updatedAt: "2026-08-06T12:00:01.000Z",
+    };
+    const newJob = {
+      id: "new-hi",
+      status: "done",
+      text: "Hi after clear",
+      reply: "Hello",
+      createdAt: "2026-08-07T20:00:00.000Z",
+      updatedAt: "2026-08-07T20:00:01.000Z",
+    };
+    await writeFile(join(dir, "old.json"), JSON.stringify(oldJob));
+    await writeFile(join(dir, "new.json"), JSON.stringify(newJob));
+
+    let state = emptyConversation();
+    state = await rebuildConversationFromJobs(dir, state);
+    assert.ok(
+      conversationToMessages(state).some((m) => /usage/i.test(m.text)),
+      "before clear, usage present"
+    );
+
+    state = startFreshConversation(state);
+    assert.equal(state.turns.length, 0);
+    assert.ok(state.clearedAt);
+    assert.equal(jobIsAfterClear(oldJob, state.clearedAt), false);
+    assert.equal(jobIsAfterClear(newJob, state.clearedAt), true);
+
+    // Simulate open after clear: rebuild must not re-append old jobs
+    state = await rebuildConversationFromJobs(dir, state);
+    const msgs = conversationToMessages(state);
+    assert.ok(
+      !msgs.some((m) => /usage/i.test(m.text)),
+      "usage job must not return after clear"
+    );
+    assert.ok(
+      msgs.some((m) => /Hi after clear|Hello/.test(m.text)),
+      "post-clear job still included"
+    );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 });
 
 test("rebuildConversationFromJobs recovers text from job files only", async () => {

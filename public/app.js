@@ -35,6 +35,7 @@ const pickCamera = $("pick-camera");
 const attachCancel = $("attach-cancel");
 
 const HISTORY_KEY = "phone_chat_history_v1";
+const CONVERSATION_ID_KEY = "phone_chat_conversation_id";
 const MAX_HISTORY = 80;
 /** Cap total stored image data (~2MB JSON safety for localStorage) */
 const MAX_IMAGE_CHARS = 1_800_000;
@@ -45,6 +46,27 @@ let busy = false;
 
 /** @type {{ role: 'user'|'bot', text: string, images?: string[], tools?: string, jobId?: string, jobStatus?: string }[]} */
 let history = [];
+
+function getStoredConversationId() {
+  return localStorage.getItem(CONVERSATION_ID_KEY) || "";
+}
+function setStoredConversationId(id) {
+  if (id) localStorage.setItem(CONVERSATION_ID_KEY, id);
+  else localStorage.removeItem(CONVERSATION_ID_KEY);
+}
+
+/** Wipe phone UI history (after /clear or Reset on Mac). */
+function clearLocalChatHistory() {
+  history = [];
+  try {
+    localStorage.removeItem(HISTORY_KEY);
+  } catch {
+    /* ignore */
+  }
+  if (messages) messages.innerHTML = "";
+  for (const [jobId] of activePolls) stopJobPoll(jobId);
+  clearHeaderJobActions();
+}
 
 /** @type {{ id: string, slash: string, label: string, description: string, insert: string }[]} */
 let toolsCatalog = [];
@@ -747,7 +769,6 @@ function startJobPoll(jobId, bodyEl, thinkingEl) {
     if (closed) return;
     applyJobToUi(job);
     setThinking(thinkingEl, { hide: true });
-    const msgEl = bodyEl.closest(".msg");
     syncHeaderJobActions(jobId, job.status);
     if (!(job.reply || "").trim() && !job.error) {
       setBodyContent(
@@ -755,6 +776,24 @@ function startJobPoll(jobId, bodyEl, thinkingEl) {
         "_(No reply text received. Tap Get result in the header, or send again.)_",
         "bot"
       );
+    }
+    // /clear or /new on Mac embeds this marker — wipe phone history to match
+    const reply = job.reply || "";
+    if (reply.includes("phone-clear-history")) {
+      const keep = {
+        role: "bot",
+        text: reply.replace(/\n*<!--\s*phone-clear-history\s*-->\s*/g, "\n").trim(),
+        jobId,
+        jobStatus: job.status || "done",
+      };
+      clearLocalChatHistory();
+      history = [keep];
+      persistHistory();
+      renderHistory();
+      // pull new conversationId from host
+      void loadHostConversation().then((host) => {
+        if (host?.conversationId) setStoredConversationId(host.conversationId);
+      });
     }
     stopJobPoll(jobId);
     setConn("connected", "ok");
@@ -915,18 +954,15 @@ function stopJobPoll(jobId) {
 async function onForegroundResume() {
   try {
     const host = await loadHostConversation();
-    if (host?.messages?.length || host?.activeJobs?.length) {
-      let merged = mergeHostHistory(history, host.messages || [], MAX_HISTORY);
-      merged = ensureActiveJobBotMessages(merged, host.activeJobs || []);
-      const before = history
-        .map((m) => (m.text || "").length)
-        .reduce((a, b) => a + b, 0);
-      const after = merged
-        .map((m) => (m.text || "").length)
-        .reduce((a, b) => a + b, 0);
-      if (after > before || merged.length !== history.length) {
-        history = merged;
-        persistHistory();
+    if (host) {
+      const prevLen = history.length;
+      const prevId = getStoredConversationId();
+      applyHostConversation(host);
+      if (
+        history.length !== prevLen ||
+        host.conversationId !== prevId ||
+        (host.messages || []).length !== prevLen
+      ) {
         renderHistory();
       }
       reattachActiveJobs(host.activeJobs || []);
@@ -1053,24 +1089,44 @@ function reattachActiveJobs(activeJobs) {
   }
 }
 
+/**
+ * Apply host conversation as source of truth.
+ * New conversationId (after /clear or Reset) replaces local history entirely
+ * so old usage/test turns never re-append at the bottom.
+ * @param {object} host
+ */
+function applyHostConversation(host) {
+  if (!host) return;
+  const hostId = host.conversationId || "";
+  const prevId = getStoredConversationId();
+  const hostMsgs = Array.isArray(host.messages) ? host.messages : [];
+  const epochChanged = !!(hostId && prevId && hostId !== prevId);
+  const freshEpoch = !!(hostId && !prevId && host.clearedAt);
+
+  if (epochChanged || freshEpoch) {
+    // Mac started a new conversation — discard local copy
+    history = mergeHostHistory([], hostMsgs, MAX_HISTORY);
+  } else if (hostMsgs.length || host.activeJobs?.length) {
+    history = mergeHostHistory(loadHistory(), hostMsgs, MAX_HISTORY);
+  } else if (hostId && host.clearedAt) {
+    // Explicit empty transcript after clear
+    history = [];
+  } else {
+    history = loadHistory();
+  }
+
+  history = ensureActiveJobBotMessages(history, host.activeJobs || []);
+  if (hostId) setStoredConversationId(hostId);
+  persistHistory();
+}
+
 async function showChat() {
   gate.classList.add("hidden");
   chat.classList.add("active");
   // Host-backed history first — like remote-control apps that always restore session text
   const host = await loadHostConversation();
-  if (host?.messages?.length || host?.activeJobs?.length) {
-    let merged = mergeHostHistory(
-      loadHistory(),
-      host.messages || [],
-      MAX_HISTORY
-    );
-    // Guarantee bot rows for mid-flight jobs so poll can attach thinking UI
-    merged = ensureActiveJobBotMessages(merged, host.activeJobs || []);
-    history = merged;
-    persistHistory();
-  } else {
-    history = loadHistory();
-  }
+  if (host) applyHostConversation(host);
+  else history = loadHistory();
   renderHistory();
   reattachActiveJobs(host?.activeJobs || []);
   checkStatus();
@@ -1439,29 +1495,11 @@ async function resetAgent() {
     const j = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(j.error || res.statusText);
 
-    // mark incomplete history as cancelled
-    for (const m of history) {
-      if (
-        m.role === "bot" &&
-        m.jobId &&
-        m.jobStatus &&
-        m.jobStatus !== "done" &&
-        m.jobStatus !== "error" &&
-        m.jobStatus !== "cancelled"
-      ) {
-        m.jobStatus = "cancelled";
-        m.text = m.text || "_(reset)_";
-      }
-    }
-    persistHistory();
-    // refresh UI thinking blocks
-    document.querySelectorAll(".msg.bot .thinking").forEach((el) => {
-      setThinking(el, { hide: true });
-    });
-    // Hide Get result / Stop & show — no active job after reset
-    clearHeaderJobActions();
+    // New conversation epoch on Mac — wipe phone UI history too
+    clearLocalChatHistory();
+    if (j.conversationId) setStoredConversationId(j.conversationId);
     setConn("connected", "ok");
-    addMsg("bot", "_Agent reset. You can send a new message._", {
+    addMsg("bot", "_Agent reset. Chat history cleared. You can send a new message._", {
       jobStatus: "done",
       showThinking: false,
     });

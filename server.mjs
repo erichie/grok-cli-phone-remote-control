@@ -46,6 +46,7 @@ import {
   conversationToMessages,
   rebuildConversationFromJobs,
   buildTranscriptPromptContext,
+  startFreshConversation,
 } from "./lib/conversation.mjs";
 import { TerminalManager } from "./lib/terminal-manager.mjs";
 import { defaultAllowedRoots, isPathAllowed } from "./lib/fs-handlers.mjs";
@@ -1935,17 +1936,19 @@ async function resetAll() {
       await persistJob(job);
     }
   }
-  // Reset is a full stop: new ACP session (explicit user action).
-  // Keep durable transcript so the phone still reloads prior text on reconnect.
+  // Full stop: new ACP session + new conversation epoch (no re-hydrate of old jobs)
   currentJobId = null;
   queueRunning = false;
+  conversation = startFreshConversation(conversation);
   await agent.reset({ fresh: true });
   conversation.acpSessionId = agent.sessionId || null;
+  agent.preferredSessionId = agent.sessionId || null;
   await persistConversation();
   return {
     ok: true,
     sessionId: agent.sessionId,
     conversationId: conversation.conversationId,
+    clearedAt: conversation.clearedAt,
     cwd: CWD,
   };
 }
@@ -2142,6 +2145,7 @@ async function handleConversation(req, res) {
     conversationId: conversation.conversationId,
     acpSessionId: agent.sessionId || conversation.acpSessionId,
     sessionResumed: !!agent.sessionResumed,
+    clearedAt: conversation.clearedAt || null,
     messages,
     turns: conversation.turns.slice(-80),
     activeJobs,
@@ -2352,14 +2356,22 @@ async function tryLocalSlashCommand(text) {
   }
 
   if (cmd === "/new" || cmd === "/clear") {
-    await agent.reset();
+    // New epoch: drop durable transcript so old usage/test jobs don't reappear on open
+    conversation = startFreshConversation(conversation);
+    await agent.reset({ fresh: true });
+    conversation.acpSessionId = agent.sessionId || null;
+    agent.preferredSessionId = agent.sessionId || null;
+    await persistConversation();
     return [
       "## New session",
       "",
       `- Fresh agent session: \`${agent.sessionId || "(starting)"}\``,
+      `- Conversation cleared (id \`${conversation.conversationId.slice(0, 8)}…\`)`,
       `- cwd: \`${CWD}\``,
       "",
-      "Phone chat history on your device is unchanged. Mac agent context was reset.",
+      "Prior phone history was cleared on the Mac. Re-open the app or unlock to sync an empty transcript on the phone.",
+      "",
+      "<!-- phone-clear-history -->",
     ].join("\n");
   }
 
