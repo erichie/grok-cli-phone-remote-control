@@ -13,7 +13,7 @@
     <meta name="application-name" content="Grok" />
     <link rel="manifest" href="/manifest.webmanifest" />
     <link rel="apple-touch-icon" href="/icon-192.png" />
-    <link rel="stylesheet" href="/styles.css?v=23" />
+    <link rel="stylesheet" href="/styles.css?v=26" />
     <title>Grok</title>
     <script src="/marked.min.js"></script>
     <script src="/purify.min.js"></script>
@@ -22,6 +22,24 @@
     <header>
       <h1>Grok</h1>
       <div class="header-right">
+        <div id="header-job-actions" class="header-job-actions hidden" aria-label="Job recovery">
+          <button
+            type="button"
+            id="header-get-result"
+            class="header-btn"
+            title="Pull the latest status/reply from the Mac"
+          >
+            Get result
+          </button>
+          <button
+            type="button"
+            id="header-stop-show"
+            class="header-btn header-btn-stop"
+            title="Stop the job and show whatever the Mac has so far"
+          >
+            Stop &amp; show
+          </button>
+        </div>
         <button type="button" id="reset-btn" class="header-btn" title="Reset agent if stuck">
           Reset
         </button>
@@ -95,6 +113,6 @@
       </div>
     </div>
 
-    <script type="module" src="/app.js?v=23"></script>
+    <script type="module" src="/app.js?v=26"></script>
   </body>
 </html>

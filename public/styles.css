@@ -69,23 +69,48 @@ header h1 {
 header .header-right {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 8px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+/* Get result / Stop & show — primary recovery, next to Reset */
+header .header-job-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+header .header-job-actions.hidden {
+  display: none;
 }
 
 header .header-btn {
   border: 1px solid #333;
   background: #0a0a0a;
   color: #ccc;
-  font-size: 12px;
+  font-size: 11px;
   font-weight: 600;
   padding: 6px 10px;
   border-radius: 999px;
   cursor: pointer;
+  white-space: nowrap;
+  -webkit-tap-highlight-color: transparent;
 }
 
 header .header-btn:active {
   background: #151515;
   color: #fff;
+}
+
+header .header-btn:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+header .header-btn-stop {
+  border-color: #444;
+  color: #aaa;
 }
 
 header .status {
@@ -425,81 +450,130 @@ header .status.bad {
   cursor: zoom-in;
 }
 
-/* Manual recovery when status never flips to done */
+/* Legacy per-message recovery rows (demoted — header is primary) */
 .msg .job-actions {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-  margin: 4px 0 12px;
-}
-
-.msg .job-actions.hidden {
   display: none;
 }
 
-.msg .job-action-btn {
-  border: 1px solid #333;
-  background: #111;
-  color: #ddd;
-  font-size: 12px;
-  font-weight: 600;
-  padding: 7px 12px;
-  border-radius: 999px;
-  cursor: pointer;
-  -webkit-tap-highlight-color: transparent;
-}
-
-.msg .job-action-btn:active {
-  background: #1a1a1a;
-  color: #fff;
-}
-
-.msg .job-action-btn:disabled {
-  opacity: 0.5;
-  cursor: default;
-}
-
-.msg .job-action-stop {
-  border-color: #444;
-  color: #aaa;
-}
-
-/* Inline thinking / tool status (not header) */
+/* Thinking sits below the reply stream — text-only breathing, no card background */
 .msg .thinking {
   font-size: 13px;
   line-height: 1.45;
   color: #8a8a8a;
-  margin: 0 0 10px;
+  margin: 10px 0 0;
+  padding: 0;
+  background: none;
   white-space: pre-wrap;
   word-break: break-word;
-  font-style: italic;
 }
 
-.msg .thinking:empty {
+.msg .thinking:empty,
+.msg .thinking[hidden] {
   display: none;
+}
+
+.msg .thinking.thinking-live {
+  background: none;
+  padding: 0;
+  animation: none;
+}
+
+.msg .thinking .think-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 4px;
 }
 
 .msg .thinking .think-label {
   font-style: normal;
   font-weight: 500;
-  color: #6a6a6a;
-  font-size: 11px;
-  letter-spacing: 0.03em;
-  text-transform: uppercase;
-  display: block;
-  margin-bottom: 4px;
+  font-size: 13px;
+  letter-spacing: 0.01em;
+  text-transform: none;
+}
+
+/* Typical AI “thinking” shimmer on the label text only */
+.msg .thinking .think-breathe {
+  background: linear-gradient(
+    90deg,
+    #555 0%,
+    #555 35%,
+    #f0f0f0 50%,
+    #555 65%,
+    #555 100%
+  );
+  background-size: 200% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  -webkit-text-fill-color: transparent;
+  animation: think-label-shimmer 2s linear infinite;
+}
+
+@keyframes think-label-shimmer {
+  0% {
+    background-position: 100% 50%;
+  }
+  100% {
+    background-position: -100% 50%;
+  }
+}
+
+/* Soft pulsing dots next to the phase */
+.msg .thinking .think-dots {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  height: 12px;
+}
+
+.msg .thinking .think-dot {
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: #999;
+  opacity: 0.3;
+  animation: think-dot-pulse 1.2s ease-in-out infinite;
+}
+
+.msg .thinking .think-dot:nth-child(1) {
+  animation-delay: 0s;
+}
+.msg .thinking .think-dot:nth-child(2) {
+  animation-delay: 0.2s;
+}
+.msg .thinking .think-dot:nth-child(3) {
+  animation-delay: 0.4s;
+}
+
+@keyframes think-dot-pulse {
+  0%,
+  80%,
+  100% {
+    opacity: 0.25;
+    transform: scale(0.9);
+  }
+  40% {
+    opacity: 0.95;
+    transform: scale(1.15);
+  }
 }
 
 .msg .thinking .think-tools {
   font-style: normal;
   font-size: 12px;
   color: #777;
-  margin-bottom: 6px;
+  margin-top: 2px;
+  margin-bottom: 0;
   font-variant-numeric: tabular-nums;
 }
 
 .msg .thinking .think-body {
-  color: #8a8a8a;
+  color: #7a7a7a;
+  font-style: italic;
+  font-size: 12px;
+  margin-top: 4px;
 }
 
 .msg .tools {

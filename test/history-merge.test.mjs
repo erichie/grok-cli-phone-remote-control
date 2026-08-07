@@ -93,6 +93,52 @@ test("ensureActiveJobBotMessages adds bot row for mid-flight job without bot", (
   assert.ok(fixed.some((m) => m.role === "user" && m.jobId === "mid-1"));
 });
 
+test("reconnect does not duplicate local user rows that lack jobId", () => {
+  // Host has full pairs with jobIds (Mac durable store)
+  const host = [
+    { role: "user", text: "Hi", jobId: "j1" },
+    { role: "bot", text: "Hi — what would you like?", jobId: "j1", jobStatus: "done" },
+    {
+      role: "user",
+      text: "Okay perfect. What were those 3 topics again?",
+      jobId: "j2",
+    },
+    {
+      role: "bot",
+      text: "These were the three podcast angles…",
+      jobId: "j2",
+      jobStatus: "done",
+    },
+  ];
+  // Local phone history: same user text WITHOUT jobId (pre-fix send path)
+  const local = [
+    { role: "user", text: "Hi" },
+    { role: "bot", text: "Hi — what would you like?", jobId: "j1", jobStatus: "done" },
+    { role: "user", text: "Okay perfect. What were those 3 topics again?" },
+    {
+      role: "bot",
+      text: "These were the three podcast angles…",
+      jobId: "j2",
+      jobStatus: "done",
+    },
+  ];
+
+  const merged = mergeHostHistory(local, host, 80);
+  const users = merged.filter((m) => m.role === "user");
+  const bots = merged.filter((m) => m.role === "bot");
+  assert.equal(users.length, 2, "exactly two user bubbles");
+  assert.equal(bots.length, 2, "exactly two bot bubbles");
+  assert.equal(merged.length, 4, "no trailing duplicates");
+  // Order preserved: user, bot, user, bot
+  assert.equal(merged[0].role, "user");
+  assert.equal(merged[1].role, "bot");
+  assert.equal(merged[2].role, "user");
+  assert.equal(merged[3].role, "bot");
+  assert.match(merged[2].text, /3 topics/);
+  // Local user without jobId got linked
+  assert.equal(merged[2].jobId, "j2");
+});
+
 test("unlock rehydrate path: merge + ensure yields bot for poll reattach", () => {
   // Simulates showChat(): merge host messages then ensureActiveJobBotMessages
   const hostMessages = [

@@ -55,6 +55,20 @@ grok-cli-phone-remote-control listening on http://0.0.0.0:8787
 
 Leave this process running (and keep the machine awake while you chat).
 
+### First-run macOS permissions (important)
+
+On the **first** times the bridge or Grok agent touches files/folders, **macOS may show permission dialogs for `node`** (and sometimes the Terminal / Grok binary), for example:
+
+- Access to folders in your workspace (`PHONE_CHAT_CWD`)
+- Access to Desktop / Documents / Downloads (if the agent opens files there)
+- Network / local network (less common)
+
+**Allow** those prompts when they appear. If you click Don’t Allow, tools like shell, read/write, and image paths will fail or hang until you fix access under:
+
+**System Settings → Privacy & Security → Files and Folders** (and **Full Disk Access** only if you intentionally grant it)
+
+You may need to restart `npm start` / the LaunchAgent after changing permissions.
+
 ### 3. Open on your phone
 
 1. Put the phone and Mac on a network where they can reach each other:

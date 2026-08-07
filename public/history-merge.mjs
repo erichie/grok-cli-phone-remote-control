@@ -17,9 +17,33 @@ export function historyEntryKey(m) {
   return "";
 }
 
+/** Normalize message body for fuzzy de-dupe (trim + collapse whitespace). */
+export function normalizeHistoryText(text) {
+  return String(text || "")
+    .trim()
+    .replace(/\s+/g, " ");
+}
+
+/**
+ * Text fingerprint for messages that never got a jobId on the phone
+ * (common for user bubbles until the Mac returns a job id).
+ * @param {{ role?: string, text?: string }} m
+ */
+export function historyTextKey(m) {
+  if (!m || (m.role !== "user" && m.role !== "bot")) return "";
+  const role = m.role === "user" ? "user" : "bot";
+  const t = normalizeHistoryText(m.text);
+  if (!t) return "";
+  return `${role}::${t}`;
+}
+
 /**
  * Merge host-backed conversation over local history.
  * Host is source of truth for job-backed turns so reconnect always loads text.
+ *
+ * Critical: local user rows often lack jobId until after send completes.
+ * Without text de-dupe they reappear at the end after force-close/reopen.
+ *
  * @param {Array} local
  * @param {Array} hostMessages
  * @param {number} [maxHistory=80]
@@ -32,63 +56,76 @@ export function mergeHostHistory(local, hostMessages, maxHistory = 80) {
   }
 
   /** @type {Map<string, object>} */
-  const byKey = new Map();
+  const byJobKey = new Map();
+  /** @type {Map<string, object>} */
+  const byTextKey = new Map();
   /** @type {object[]} */
   const out = [];
 
+  const indexEntry = (entry) => {
+    const jk = historyEntryKey(entry);
+    if (jk) byJobKey.set(jk, entry);
+    const tk = historyTextKey(entry);
+    if (tk) byTextKey.set(tk, entry);
+  };
+
   const pushOrMerge = (m) => {
     if (!m || (m.role !== "user" && m.role !== "bot")) return;
-    const key = historyEntryKey(m);
-    if (key) {
-      const prev = byKey.get(key);
-      if (prev) {
-        // Same role+jobId: prefer longer body; always take fresher jobStatus/tools
-        if ((m.text || "").length >= (prev.text || "").length) {
-          prev.text = m.text;
-        }
-        if (m.jobStatus) prev.jobStatus = m.jobStatus;
-        if (m.tools) prev.tools = m.tools;
-        if (m.images?.length && !prev.images?.length) prev.images = m.images;
-        return;
+    const role = m.role === "user" ? "user" : "bot";
+    const jobKey = historyEntryKey(m);
+    const textKey = historyTextKey(m);
+
+    // 1) Same role+jobId
+    if (jobKey && byJobKey.has(jobKey)) {
+      const prev = byJobKey.get(jobKey);
+      if ((m.text || "").length >= (prev.text || "").length) {
+        prev.text = m.text;
       }
-      const entry = {
-        role: m.role === "user" ? "user" : "bot",
-        text: m.text || "",
-        jobId: m.jobId,
-        jobStatus: m.jobStatus,
-        tools: m.tools,
-        images: m.images,
-      };
-      byKey.set(key, entry);
-      out.push(entry);
+      if (m.jobStatus) prev.jobStatus = m.jobStatus;
+      if (m.tools) prev.tools = m.tools;
+      if (m.images?.length && !prev.images?.length) prev.images = m.images;
+      // Keep text index in sync if body grew
+      const tk = historyTextKey(prev);
+      if (tk) byTextKey.set(tk, prev);
       return;
     }
-    // No jobId: append as local-only (do not de-dupe by text)
-    out.push({
-      role: m.role === "user" ? "user" : "bot",
+
+    // 2) Same role + same text (local user without jobId vs host with jobId)
+    if (textKey && byTextKey.has(textKey)) {
+      const prev = byTextKey.get(textKey);
+      // Prefer jobId from either side
+      if (!prev.jobId && m.jobId) {
+        prev.jobId = m.jobId;
+        const jk = historyEntryKey(prev);
+        if (jk) byJobKey.set(jk, prev);
+      }
+      if (m.jobStatus) prev.jobStatus = m.jobStatus;
+      if (m.tools) prev.tools = m.tools;
+      if (m.images?.length && !prev.images?.length) prev.images = m.images;
+      if ((m.text || "").length > (prev.text || "").length) {
+        prev.text = m.text;
+      }
+      return;
+    }
+
+    const entry = {
+      role,
       text: m.text || "",
+      jobId: m.jobId,
+      jobStatus: m.jobStatus,
       tools: m.tools,
       images: m.images,
-    });
+    };
+    out.push(entry);
+    indexEntry(entry);
   };
 
   // Host first (survives phone cache wipe)
   for (const m of host) pushOrMerge(m);
 
-  // Local can enrich images / longer text for same role+jobId
+  // Local enriches or adds only true new turns
   for (const m of local || []) {
-    const key = historyEntryKey(m);
-    if (key && byKey.has(key)) {
-      const prev = byKey.get(key);
-      if ((m.text || "").length > (prev.text || "").length) {
-        prev.text = m.text;
-      }
-      if (m.images?.length && !prev.images?.length) prev.images = m.images;
-      if (m.jobStatus && !prev.jobStatus) prev.jobStatus = m.jobStatus;
-      continue;
-    }
-    if (!key) pushOrMerge(m);
-    else pushOrMerge(m);
+    pushOrMerge(m);
   }
 
   return out.slice(-maxHistory);

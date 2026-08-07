@@ -21,6 +21,7 @@ test("PWA public assets exist", () => {
     "public/index.html",
     "public/app.js",
     "public/history-merge.mjs",
+    "public/thinking-ui.mjs",
     "public/styles.css",
     "public/sw.js",
     "public/manifest.webmanifest",
