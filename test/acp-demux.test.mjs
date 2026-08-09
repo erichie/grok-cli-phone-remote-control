@@ -220,7 +220,11 @@ test("server.mjs wires GrokAcp through AcpLineHandler / classify demux", () => {
   const src = readFileSync(join(root, "server.mjs"), "utf8");
   assert.match(src, /AcpLineHandler/);
   assert.match(src, /lineHandler\.onLine/);
-  assert.match(src, /agent\.stop\(\)/);
+  // Multi-agent: runJob uses per-slot `acp` (main still aliased as `agent`)
+  assert.match(src, /acp\.stop\(\)|agent\.stop\(\)/);
   // headless path must stop wedged agent, not only start()
   assert.match(src, /stop\(\).*headless|before headless|agent stop before headless/s);
+  // Process-group kill for concurrent agents
+  assert.match(src, /killProcessTree/);
+  assert.match(src, /createAgentRegistry/);
 });

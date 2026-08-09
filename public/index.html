@@ -13,14 +13,30 @@
     <meta name="application-name" content="Grok" />
     <link rel="manifest" href="/manifest.webmanifest" />
     <link rel="apple-touch-icon" href="/icon-192.png" />
-    <link rel="stylesheet" href="/styles.css?v=28" />
+    <link rel="stylesheet" href="/styles.css?v=31" />
     <title>Grok</title>
     <script src="/marked.min.js"></script>
     <script src="/purify.min.js"></script>
   </head>
   <body>
     <header>
-      <h1>Grok</h1>
+      <div class="header-left">
+        <button
+          type="button"
+          id="menu-btn"
+          class="menu-btn"
+          title="Jobs and agents on the Mac"
+          aria-label="Open menu"
+          aria-controls="activity-panel"
+          aria-expanded="false"
+        >
+          <span class="menu-icon" aria-hidden="true">
+            <span></span><span></span><span></span>
+          </span>
+          <span id="menu-badge" class="menu-badge hidden" aria-hidden="true">0</span>
+        </button>
+        <h1>Grok</h1>
+      </div>
       <div class="header-right">
         <div id="header-job-actions" class="header-job-actions hidden" aria-label="Job recovery">
           <button
@@ -68,6 +84,12 @@
     </section>
 
     <section id="chat">
+      <div id="agent-chip-bar" class="agent-chip-bar hidden" aria-label="Send target">
+        <span class="agent-chip-label">To</span>
+        <button type="button" id="agent-chip" class="agent-chip" title="Current agent session — tap to cycle, or open menu">
+          Main
+        </button>
+      </div>
       <div id="messages-wrap">
         <div id="messages"></div>
         <button
@@ -103,6 +125,48 @@
       </div>
     </section>
 
+    <!-- Left menu: jobs + concurrent agents on the Mac -->
+    <div id="activity-drawer" class="activity-drawer hidden" aria-hidden="true">
+      <div class="activity-backdrop" id="activity-backdrop"></div>
+      <aside
+        id="activity-panel"
+        class="activity-panel"
+        role="dialog"
+        aria-label="Menu"
+        aria-modal="true"
+      >
+        <div class="activity-header">
+          <h2>Menu</h2>
+          <button type="button" id="activity-close" class="header-btn" aria-label="Close menu">
+            Close
+          </button>
+        </div>
+        <div class="activity-body">
+          <section class="activity-section" aria-labelledby="activity-agents-title">
+            <div class="activity-section-head">
+              <h3 id="activity-agents-title">Agents</h3>
+              <button type="button" id="activity-spawn" class="activity-link-btn" title="Spawn another Grok process on the Mac">
+                + Agent
+              </button>
+            </div>
+            <p class="activity-hint">
+              Tap an agent to open its chat (history is separate per agent). Stop kills that process on the Mac.
+            </p>
+            <div id="activity-agents" class="activity-list"></div>
+          </section>
+          <section class="activity-section" aria-labelledby="activity-jobs-title">
+            <div class="activity-section-head">
+              <h3 id="activity-jobs-title">Jobs</h3>
+              <button type="button" id="activity-refresh" class="activity-link-btn" title="Refresh from Mac">
+                Refresh
+              </button>
+            </div>
+            <div id="activity-jobs" class="activity-list"></div>
+          </section>
+        </div>
+      </aside>
+    </div>
+
     <!-- Attach sheet: library vs camera -->
     <div id="attach-sheet" class="sheet hidden" aria-hidden="true">
       <div class="sheet-backdrop" id="attach-backdrop"></div>
@@ -113,6 +177,6 @@
       </div>
     </div>
 
-    <script type="module" src="/app.js?v=28"></script>
+    <script type="module" src="/app.js?v=31"></script>
   </body>
 </html>

@@ -51,6 +51,10 @@ import {
 import { TerminalManager } from "./lib/terminal-manager.mjs";
 import { defaultAllowedRoots, isPathAllowed } from "./lib/fs-handlers.mjs";
 import { AcpLineHandler } from "./lib/acp-line-handler.mjs";
+import {
+  createAgentRegistry,
+  killProcessTree,
+} from "./lib/agent-registry.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PUBLIC = join(__dirname, "public");
@@ -405,18 +409,8 @@ class GrokAcp {
     this.sessionResumed = false;
     this.nextId = 1;
     if (proc && !proc.killed) {
-      try {
-        proc.kill("SIGTERM");
-      } catch {
-        /* ignore */
-      }
-      // hard kill hung agents (0% CPU stuck mid-turn)
-      await new Promise((r) => setTimeout(r, 400));
-      try {
-        if (!proc.killed) proc.kill("SIGKILL");
-      } catch {
-        /* ignore */
-      }
+      // SIGTERM → SIGKILL; process-group kill when detached (Unix)
+      await killProcessTree(proc, { graceMs: 400 });
     }
   }
 
@@ -443,6 +437,8 @@ class GrokAcp {
         cwd: this.cwd,
         stdio: ["pipe", "pipe", "pipe"],
         env: { ...process.env },
+        // New process group on Unix so stop() can kill shell grandchildren
+        detached: process.platform !== "win32",
       }
     );
     this.proc.stderr?.on("data", (c) => {
@@ -617,7 +613,14 @@ class GrokAcp {
   }
 }
 
-const agent = new GrokAcp(CWD);
+const MAX_AGENTS = Number(process.env.PHONE_CHAT_MAX_AGENTS || 6);
+const registry = createAgentRegistry({
+  createAcp: (cwd) => new GrokAcp(cwd),
+  defaultCwd: CWD,
+  maxAgents: Number.isFinite(MAX_AGENTS) && MAX_AGENTS >= 1 ? MAX_AGENTS : 6,
+});
+/** Main ACP instance (back-compat). Extra agents live in `registry`. */
+const agent = registry.main.acp;
 /** @type {import('./lib/conversation.mjs').ConversationState} */
 let conversation = emptyConversation();
 
@@ -633,12 +636,17 @@ async function persistConversation() {
 async function rememberJobInConversation(job) {
   if (!job?.id) return;
   upsertJobInConversation(conversation, job);
-  if (job.sessionId) {
-    conversation.acpSessionId = job.sessionId;
-    agent.preferredSessionId = job.sessionId;
-  } else if (agent.sessionId) {
-    conversation.acpSessionId = agent.sessionId;
-    agent.preferredSessionId = agent.sessionId;
+  // Durable transcript is shared; ACP session resume only applies to main.
+  // Extra concurrent agents keep their own process-local sessionIds.
+  const agentId = job.agentId || "main";
+  if (agentId === "main" || agentId === "default") {
+    if (job.sessionId) {
+      conversation.acpSessionId = job.sessionId;
+      agent.preferredSessionId = job.sessionId;
+    } else if (agent.sessionId) {
+      conversation.acpSessionId = agent.sessionId;
+      agent.preferredSessionId = agent.sessionId;
+    }
   }
   await persistConversation();
 }
@@ -739,11 +747,38 @@ async function readBody(req, maxBytes = MAX_BODY_BYTES) {
 // ─── Durable job queue (work on Mac; phone can lock / disconnect) ───────────
 /** @type {Map<string, object>} */
 const jobs = new Map();
-/** @type {string[]} */
-const jobQueue = [];
-let queueRunning = false;
-/** @type {string | null} */
-let currentJobId = null;
+/**
+ * Per-agent queues live on registry slots (jobQueue / currentJobId / queueRunning).
+ * Helpers below keep cancel/status/sweep multi-agent aware.
+ */
+function slotFor(agentId) {
+  return registry.get(agentId) || registry.main;
+}
+
+function allSlots() {
+  return registry.list().map((a) => registry.get(a.id)).filter(Boolean);
+}
+
+function isCurrentJobAnywhere(jobId) {
+  return allSlots().some((s) => s.currentJobId === jobId);
+}
+
+function anyQueueRunning() {
+  return allSlots().some((s) => s.queueRunning);
+}
+
+function totalQueueLength() {
+  return allSlots().reduce((n, s) => n + s.jobQueue.length, 0);
+}
+
+/** Main-agent aliases for back-compat within this file where still single-path. */
+const jobQueue = registry.main.jobQueue;
+function getMainQueueRunning() {
+  return registry.main.queueRunning;
+}
+function getMainCurrentJobId() {
+  return registry.main.currentJobId;
+}
 
 function jobPath(id) {
   return join(JOBS_DIR, `${id}.json`);
@@ -785,8 +820,17 @@ async function recoverJobsOnStartup() {
       await persistJob(job);
       interrupted++;
     } else if (job.status === "queued") {
-      if (!jobQueue.includes(job.id)) {
-        jobQueue.push(job.id);
+      // Extra agents do not survive restart — fold onto main queue
+      if (job.agentId && job.agentId !== "main") {
+        job.agentId = "main";
+        job.updatedAt = new Date().toISOString();
+        await persistJob(job);
+      } else {
+        job.agentId = "main";
+      }
+      const slot = slotFor("main");
+      if (!slot.jobQueue.includes(job.id)) {
+        slot.jobQueue.push(job.id);
         requeued++;
       }
     }
@@ -796,7 +840,7 @@ async function recoverJobsOnStartup() {
       `[jobs] startup recovery: interrupted=${interrupted} requeued=${requeued}`
     );
   }
-  if (requeued) void processQueue();
+  if (requeued) void processQueue("main");
 }
 
 /**
@@ -812,8 +856,9 @@ async function sweepOrphanJobs() {
     if (job.status !== "running") continue;
     // Never touch the active job, even if it's been silent for a while —
     // runAgentTurn's idle watchdog owns that case.
-    if (id === currentJobId) continue;
-    if (queueRunning && jobQueue.includes(id)) continue;
+    if (isCurrentJobAnywhere(id)) continue;
+    const slot = slotFor(job.agentId || "main");
+    if (slot.queueRunning && slot.jobQueue.includes(id)) continue;
 
     const updated = Date.parse(job.updatedAt || job.startedAt || 0) || 0;
     if (now - updated < ORPHAN_AGE_MS) continue;
@@ -829,17 +874,17 @@ async function sweepOrphanJobs() {
     job.updatedAt = job.finishedAt;
     await persistJob(job);
     console.warn(
-      `[jobs] swept orphan running job ${id} (silent ${Math.round((now - updated) / 1000)}s, current=${currentJobId})`
+      `[jobs] swept orphan running job ${id} (silent ${Math.round((now - updated) / 1000)}s, agent=${job.agentId || "main"})`
     );
   }
 
-  // Disk-only: only after long silence, never if it matches currentJobId
+  // Disk-only: only after long silence, never if it matches a live current job
   try {
     const names = await readdir(JOBS_DIR);
     for (const name of names) {
       if (!name.endsWith(".json")) continue;
       const id = name.replace(/\.json$/, "");
-      if (id === currentJobId) continue;
+      if (isCurrentJobAnywhere(id)) continue;
       if (jobs.has(id)) continue;
       try {
         let job;
@@ -880,6 +925,9 @@ async function sweepOrphanJobs() {
 
 function publicJob(job) {
   const replyImages = Array.isArray(job.replyImages) ? job.replyImages : [];
+  const agentId = job.agentId || "main";
+  const slot = slotFor(agentId);
+  const agentPub = registry.list().find((a) => a.id === agentId);
   return {
     id: job.id,
     status: job.status,
@@ -893,8 +941,12 @@ function publicJob(job) {
     thought: job.thought || "",
     tools: job.tools || [],
     error: job.error || null,
+    agentId,
+    agentLabel: agentPub?.label || (agentId === "main" ? "Main" : agentId.slice(0, 8)),
     queuePosition:
-      job.status === "queued" ? Math.max(0, jobQueue.indexOf(job.id) + 1) : 0,
+      job.status === "queued"
+        ? Math.max(0, slot.jobQueue.indexOf(job.id) + 1)
+        : 0,
     sessionId: job.sessionId || null,
     /** Generated images (Imagine etc.) — client loads via /api/jobs/:id/media/:i */
     images: replyImages.map((p, i) => ({
@@ -1294,6 +1346,8 @@ function isTransientAgentError(msg) {
  */
 async function runAgentTurn(job, promptText, opts = {}) {
   const attempt = opts.attempt || 1;
+  /** @type {GrokAcp} */
+  const acp = opts.acp || agent;
   let timedOut = false;
   let idleTimedOut = false;
   const turnStartMs = Date.now();
@@ -1320,8 +1374,8 @@ async function runAgentTurn(job, promptText, opts = {}) {
     console.warn(
       `[jobs] ${job.id} timeout reason=${reason} attempt=${attempt} silent=${Math.round((Date.now() - lastProgressMs) / 1000)}s`
     );
-    void agent.cancel();
-    void agent.reset().catch((e) =>
+    void acp.cancel();
+    void acp.reset().catch((e) =>
       console.warn("[jobs] reset after timeout", e.message)
     );
   };
@@ -1344,7 +1398,7 @@ async function runAgentTurn(job, promptText, opts = {}) {
 
   // Ensure agent is up before prompting
   try {
-    await agent.start();
+    await acp.start();
   } catch (e) {
     clearInterval(watch);
     return {
@@ -1356,7 +1410,7 @@ async function runAgentTurn(job, promptText, opts = {}) {
   }
 
   try {
-    await agent.prompt(
+    await acp.prompt(
       { text: promptText, imagePaths: job.imagePaths || [] },
       (ev) => {
         // Cancel / Stop & show sealed the job — ignore further stream chunks
@@ -1387,7 +1441,7 @@ async function runAgentTurn(job, promptText, opts = {}) {
 
     await scanNewSessionImages(
       job,
-      agent.sessionId || job.sessionId,
+      acp.sessionId || job.sessionId,
       turnStartMs
     );
     appendImageMarkdown(job);
@@ -1407,7 +1461,7 @@ async function runAgentTurn(job, promptText, opts = {}) {
     const msg = e instanceof Error ? e.message : String(e);
     await scanNewSessionImages(
       job,
-      agent.sessionId || job.sessionId,
+      acp.sessionId || job.sessionId,
       turnStartMs
     ).catch(() => {});
     appendImageMarkdown(job);
@@ -1485,11 +1539,17 @@ async function loadRecentFinishedJobs(excludeId, limit = 4) {
   return out.slice(0, limit);
 }
 
-async function runJob(job) {
+/**
+ * @param {object} job
+ * @param {GrokAcp} [acpInst] agent process for this job's slot
+ */
+async function runJob(job, acpInst) {
+  const acp = acpInst || slotFor(job.agentId || "main").acp || agent;
   if (isJobSealed(job)) return; // phone already Stop & show / cancel'd
   job.status = "running";
   job.startedAt = job.startedAt || new Date().toISOString();
   job.updatedAt = new Date().toISOString();
+  job.agentId = job.agentId || "main";
   if (!job.reply) job.reply = "";
   if (!job.thought) job.thought = "";
   if (!job.tools) job.tools = [];
@@ -1510,7 +1570,7 @@ async function runJob(job) {
     }
     job.finishedAt = new Date().toISOString();
     job.updatedAt = job.finishedAt;
-    job.sessionId = agent.sessionId;
+    job.sessionId = acp.sessionId;
     await persistJob(job);
     return;
   }
@@ -1522,7 +1582,7 @@ async function runJob(job) {
     job.error = null;
     job.finishedAt = new Date().toISOString();
     job.updatedAt = job.finishedAt;
-    job.sessionId = agent.sessionId;
+    job.sessionId = acp.sessionId;
     await persistJob(job);
     return;
   }
@@ -1536,7 +1596,7 @@ async function runJob(job) {
       job.error = null;
       job.finishedAt = new Date().toISOString();
       job.updatedAt = job.finishedAt;
-      job.sessionId = agent.sessionId;
+      job.sessionId = acp.sessionId;
       await persistJob(job);
       return;
     }
@@ -1550,7 +1610,7 @@ async function runJob(job) {
   // Always inject for short follow-ups ("yes please") even if session was loaded —
   // load may not replay tool-side history the model needs for confirmations.
   const needTranscript =
-    !agent.sessionResumed || isShortFollowUp(job.text);
+    !acp.sessionResumed || isShortFollowUp(job.text);
   if (needTranscript) {
     try {
       const fromConv = buildTranscriptPromptContext(
@@ -1561,7 +1621,7 @@ async function runJob(job) {
       if (fromConv) {
         promptText = `${fromConv}\n\nUser's latest message: ${job.text.trim()}`;
         console.log(
-          `[jobs] ${job.id} injected durable transcript (resumed=${!!agent.sessionResumed})`
+          `[jobs] ${job.id} injected durable transcript (resumed=${!!acp.sessionResumed})`
         );
       } else if (isShortFollowUp(job.text)) {
         const recent = await loadRecentFinishedJobs(job.id, 3);
@@ -1599,7 +1659,7 @@ async function runJob(job) {
           : `\n\n[System: previous attempt failed (${lastResult.error || "agent error"}). Retry and give a complete answer.]`);
       // Ensure a healthy agent process
       try {
-        await agent.reset();
+        await acp.reset();
       } catch (e) {
         console.warn("[jobs] agent reset before retry failed", e.message);
       }
@@ -1611,7 +1671,7 @@ async function runJob(job) {
     job.updatedAt = new Date().toISOString();
     await persistJob(job);
 
-    lastResult = await runAgentTurn(job, promptText, { attempt });
+    lastResult = await runAgentTurn(job, promptText, { attempt, acp });
 
     // Phone tapped "Stop & show" / cancel while we were working
     if (isJobSealed(job)) return;
@@ -1654,7 +1714,7 @@ async function runJob(job) {
       }
       job.finishedAt = new Date().toISOString();
       job.updatedAt = job.finishedAt;
-      job.sessionId = agent.sessionId;
+      job.sessionId = acp.sessionId;
       await persistJob(job);
       return;
     }
@@ -1684,12 +1744,12 @@ async function runJob(job) {
       `[jobs] ${job.id} falling back to headless -p after agent failure: ${lastResult.error}`
     );
     try {
-      await agent.cancel();
+      await acp.cancel();
     } catch {
       /* ignore */
     }
     try {
-      await agent.stop();
+      await acp.stop();
     } catch (e) {
       console.warn("[jobs] agent stop before headless failed", e.message);
     }
@@ -1734,9 +1794,9 @@ async function runJob(job) {
     if (last?.name === "headless_fallback") last.status = "completed";
     job.finishedAt = new Date().toISOString();
     job.updatedAt = job.finishedAt;
-    job.sessionId = agent.sessionId;
+    job.sessionId = acp.sessionId;
     // Fresh long-lived agent for subsequent phone messages
-    void agent.start().catch((e) =>
+    void acp.start().catch((e) =>
       console.warn("[jobs] agent restart after headless failed", e.message)
     );
     await persistJob(job);
@@ -1749,44 +1809,48 @@ async function runJob(job) {
       reason: `${lastResult.error || "failed"}; headless: ${msg}`,
       status: "error",
     });
-    job.sessionId = agent.sessionId;
+    job.sessionId = acp.sessionId;
     // Still kill/restart so the next message does not reuse a wedged session
     try {
-      await agent.stop();
+      await acp.stop();
     } catch {
       /* ignore */
     }
-    void agent.start().catch(() => {});
+    void acp.start().catch(() => {});
     await persistJob(job);
   }
 }
 
-async function processQueue() {
-  if (queueRunning) return;
-  queueRunning = true;
+async function processQueue(agentId = "main") {
+  const slot = slotFor(agentId);
+  if (slot.queueRunning) return;
+  slot.queueRunning = true;
+  const acp = slot.acp;
   try {
-    while (jobQueue.length) {
-      const id = jobQueue.shift();
+    while (slot.jobQueue.length) {
+      const id = slot.jobQueue.shift();
       const job = jobs.get(id) || (await loadJob(id));
       if (!job || job.status === "done" || job.status === "error") continue;
       // cancelled while waiting
       if (job.status === "cancelled") continue;
-      currentJobId = id;
+      job.agentId = job.agentId || slot.id;
+      slot.currentJobId = id;
+      registry.touch(slot.id);
       try {
         // Always warm agent before a turn so replies don't die on cold start
-        if (!agent.sessionId) {
+        if (!acp.sessionId) {
           try {
-            await agent.start();
+            await acp.start();
           } catch (e) {
-            console.error("[queue] agent start failed:", e.message);
+            console.error(`[queue:${slot.id}] agent start failed:`, e.message);
             try {
-              await agent.reset();
+              await acp.reset();
             } catch {
               /* ignore */
             }
           }
         }
-        await runJob(job);
+        await runJob(job, acp);
         // Guarantee terminal status so phone poll always exits
         if (!isJobSealed(job)) {
           forceTerminalizeJob(job, {
@@ -1806,7 +1870,7 @@ async function processQueue() {
         if (isJobSealed(job)) {
           /* phone already took ownership of the result */
         } else {
-          console.error("[queue] runJob threw", e);
+          console.error(`[queue:${slot.id}] runJob threw`, e);
           job.status = "error";
           job.error = e instanceof Error ? e.message : String(e);
           job.reply =
@@ -1817,12 +1881,12 @@ async function processQueue() {
           await persistJob(job);
         }
       } finally {
-        if (currentJobId === id) currentJobId = null;
+        if (slot.currentJobId === id) slot.currentJobId = null;
       }
     }
   } finally {
-    queueRunning = false;
-    currentJobId = null;
+    slot.queueRunning = false;
+    slot.currentJobId = null;
   }
 }
 
@@ -1834,22 +1898,35 @@ async function processQueue() {
  * await runJob was still in flight → concurrent agent use.
  */
 async function interruptActiveAgent(jobId) {
-  if (currentJobId !== jobId) return;
+  let slot = null;
+  for (const s of allSlots()) {
+    if (s.currentJobId === jobId) {
+      slot = s;
+      break;
+    }
+  }
+  if (!slot) {
+    // Fall back: job may record agentId
+    const job = jobs.get(jobId);
+    if (job?.agentId) slot = slotFor(job.agentId);
+  }
+  if (!slot || slot.currentJobId !== jobId) return;
+  const acp = slot.acp;
   try {
-    await agent.cancel();
+    await acp.cancel();
   } catch {
     /* ignore */
   }
   try {
-    await agent.reset();
+    await acp.reset();
   } catch {
     /* ignore */
   }
   // Do NOT clear queueRunning or call processQueue() — active loop resumes.
   // Only kick the queue if no loop is currently driving it (stuck bookkeeping).
-  if (!queueRunning) {
-    currentJobId = null;
-    void processQueue();
+  if (!slot.queueRunning) {
+    slot.currentJobId = null;
+    void processQueue(slot.id);
   }
 }
 
@@ -1867,8 +1944,9 @@ async function finalizeJob(id) {
   ) {
     return job;
   }
-  const idx = jobQueue.indexOf(id);
-  if (idx >= 0) jobQueue.splice(idx, 1);
+  const slot = slotFor(job.agentId || "main");
+  const idx = slot.jobQueue.indexOf(id);
+  if (idx >= 0) slot.jobQueue.splice(idx, 1);
 
   const partial = (job.reply || "").trim();
   // Critical: seal so runJob headless/success/stream cannot overwrite.
@@ -1892,9 +1970,10 @@ async function cancelJob(id) {
   if (job.status === "done" || job.status === "error" || job.status === "cancelled") {
     return job;
   }
+  const slot = slotFor(job.agentId || "main");
   // remove from queue if waiting
-  const idx = jobQueue.indexOf(id);
-  if (idx >= 0) jobQueue.splice(idx, 1);
+  const idx = slot.jobQueue.indexOf(id);
+  if (idx >= 0) slot.jobQueue.splice(idx, 1);
 
   // Critical: seal so runJob cannot headless-overwrite cancelled → done.
   sealJob(job, {
@@ -1905,10 +1984,14 @@ async function cancelJob(id) {
   await persistJob(job);
 
   // if this job is the hung running one, kill agent so the active queue loop continues
-  if (currentJobId === id) {
-    // mark any other stuck "running" as cancelled (orphans after crash)
+  if (slot.currentJobId === id || isCurrentJobAnywhere(id)) {
+    // mark other stuck "running" on the same agent as cancelled
     for (const [jid, j] of jobs) {
-      if (j.status === "running" && jid !== id) {
+      if (
+        j.status === "running" &&
+        jid !== id &&
+        (j.agentId || "main") === (job.agentId || "main")
+      ) {
         j.userFinalized = true;
         j.status = "error";
         j.error = "interrupted by cancel";
@@ -1923,8 +2006,12 @@ async function cancelJob(id) {
 }
 
 async function resetAll() {
-  // cancel everything pending — mark userFinalized so in-flight runJob cannot overwrite
-  jobQueue.length = 0;
+  // Cancel everything pending on every agent slot
+  for (const slot of allSlots()) {
+    slot.jobQueue.length = 0;
+    slot.currentJobId = null;
+    slot.queueRunning = false;
+  }
   for (const [, job] of jobs) {
     if (job.status === "queued" || job.status === "running") {
       job.userFinalized = true;
@@ -1936,9 +2023,12 @@ async function resetAll() {
       await persistJob(job);
     }
   }
-  // Full stop: new ACP session + new conversation epoch (no re-hydrate of old jobs)
-  currentJobId = null;
-  queueRunning = false;
+  // Kill extra concurrent agents hard; reset main to a fresh session
+  try {
+    await registry.stopAllExtras();
+  } catch (e) {
+    console.warn("[reset] stopAllExtras", e.message);
+  }
   conversation = startFreshConversation(conversation);
   await agent.reset({ fresh: true });
   conversation.acpSessionId = agent.sessionId || null;
@@ -1950,6 +2040,7 @@ async function resetAll() {
     conversationId: conversation.conversationId,
     clearedAt: conversation.clearedAt,
     cwd: CWD,
+    agents: registry.list(),
   };
 }
 
@@ -1994,6 +2085,21 @@ async function handleChat(req, res) {
     imagePaths.push(path);
   }
 
+  // Route to a concurrent agent slot (default: main)
+  let agentId = String(body.agentId || "main").trim() || "main";
+  if (agentId === "default") agentId = "main";
+  // auto: pick idle agent, or main if all busy
+  if (agentId === "auto") {
+    const idle = registry.list().find((a) => !a.processing && a.queueLength === 0);
+    agentId = idle?.id || "main";
+  }
+  let slot;
+  try {
+    slot = registry.require(agentId);
+  } catch {
+    return sendJson(res, 404, { error: `agent not found: ${agentId}` });
+  }
+
   const id = randomUUID();
   const now = new Date().toISOString();
   const job = {
@@ -2009,23 +2115,27 @@ async function handleChat(req, res) {
     tools: [],
     error: null,
     sessionId: null,
+    agentId: slot.id,
   };
-  // Only "queued" if something is already running or waiting — otherwise start now.
-  const mustWait = queueRunning || jobQueue.length > 0;
-  const queuePosition = mustWait ? jobQueue.length + 1 : 0;
+  // Only "queued" if this agent is already running or waiting — otherwise start now.
+  const mustWait = slot.queueRunning || slot.jobQueue.length > 0;
+  const queuePosition = mustWait ? slot.jobQueue.length + 1 : 0;
   if (!mustWait) {
     job.status = "running"; // will be set again in runJob; avoids false "queued" flash
   }
   jobs.set(id, job);
-  jobQueue.push(id);
+  slot.jobQueue.push(id);
+  registry.touch(slot.id);
   await persistJob(job);
-  void processQueue();
+  void processQueue(slot.id);
 
   sendJson(res, 202, {
     jobId: id,
     status: mustWait ? "queued" : "running",
     queuePosition,
-    cwd: CWD,
+    agentId: slot.id,
+    agentLabel: slot.label,
+    cwd: slot.cwd || CWD,
   });
 }
 
@@ -2088,15 +2198,22 @@ async function handleJobsList(req, res) {
     .sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1))
     .slice(0, 40)
     .map(publicJob);
+  const active = list.filter(
+    (j) => j.status === "running" || j.status === "queued"
+  );
   sendJson(res, 200, {
     jobs: list,
-    queueLength: jobQueue.length,
-    processing: queueRunning,
+    active,
+    queueLength: totalQueueLength(),
+    processing: anyQueueRunning(),
+    agents: registry.list(),
+    maxAgents: registry.maxAgents,
   });
 }
 
 async function handleStatus(req, res) {
   if (!authOk(req)) return sendJson(res, 401, { error: "unauthorized" });
+  const agents = registry.list();
   sendJson(res, 200, {
     ok: true,
     cwd: CWD,
@@ -2104,9 +2221,13 @@ async function handleStatus(req, res) {
     sessionResumed: !!agent.sessionResumed,
     conversationId: conversation.conversationId,
     agentReady: !!agent.sessionId,
-    queueLength: jobQueue.length,
-    processing: queueRunning,
-    currentJobId,
+    queueLength: totalQueueLength(),
+    processing: anyQueueRunning(),
+    currentJobId: getMainCurrentJobId(),
+    currentJobIds: agents.map((a) => a.currentJobId).filter(Boolean),
+    agents,
+    agentCount: agents.length,
+    maxAgents: registry.maxAgents,
     turnCount: conversation.turns?.length || 0,
   });
 }
@@ -2149,9 +2270,133 @@ async function handleConversation(req, res) {
     messages,
     turns: conversation.turns.slice(-80),
     activeJobs,
-    currentJobId,
-    processing: queueRunning,
+    currentJobId: getMainCurrentJobId(),
+    currentJobIds: registry.list().map((a) => a.currentJobId).filter(Boolean),
+    processing: anyQueueRunning(),
+    agents: registry.list(),
   });
+}
+
+/**
+ * Cancel all queued/running jobs for one agent, then hard-stop the Mac process.
+ * @param {string} agentId
+ * @param {{ remove?: boolean }} [opts]
+ */
+async function stopAgentHard(agentId, opts = {}) {
+  const slot = registry.require(agentId);
+  const pending = [];
+  for (const [jid, j] of jobs) {
+    if ((j.agentId || "main") !== slot.id) continue;
+    if (j.status === "queued" || j.status === "running") pending.push(jid);
+  }
+  for (const jid of pending) {
+    try {
+      await cancelJob(jid);
+    } catch (e) {
+      console.warn("[agents] cancel on stop", jid, e.message);
+    }
+  }
+  // Drain queue bookkeeping then kill process (process group)
+  slot.jobQueue.length = 0;
+  slot.currentJobId = null;
+  slot.queueRunning = false;
+  const out = await registry.stop(slot.id, {
+    remove: !!opts.remove && !slot.isMain,
+  });
+  return out;
+}
+
+/** GET /api/agents */
+async function handleAgentsList(req, res) {
+  if (!authOk(req)) return sendJson(res, 401, { error: "unauthorized" });
+  sendJson(res, 200, {
+    agents: registry.list(),
+    maxAgents: registry.maxAgents,
+    count: registry.size,
+  });
+}
+
+/** POST /api/agents — spawn a concurrent agent process on the Mac */
+async function handleAgentCreate(req, res) {
+  if (!authOk(req)) return sendJson(res, 401, { error: "unauthorized" });
+  let body = {};
+  try {
+    const raw = (await readBody(req)).toString("utf8");
+    if (raw.trim()) body = JSON.parse(raw);
+  } catch (e) {
+    if (e && e.code === "BODY_TOO_LARGE") {
+      return sendJson(res, 413, { error: e.message });
+    }
+    return sendJson(res, 400, { error: "invalid json" });
+  }
+  try {
+    const created = registry.create({
+      label: body.label,
+      cwd: body.cwd,
+    });
+    // Warm-start ACP process so Activity shows alive quickly
+    const slot = registry.get(created.id);
+    if (slot?.acp) {
+      void slot.acp.start().catch((e) =>
+        console.warn("[agents] start failed", created.id, e.message)
+      );
+    }
+    sendJson(res, 201, { agent: created, agents: registry.list() });
+  } catch (e) {
+    const code = e?.code === "MAX_AGENTS" ? 409 : 500;
+    sendJson(res, code, {
+      error: e instanceof Error ? e.message : String(e),
+      code: e?.code || "ERROR",
+    });
+  }
+}
+
+/**
+ * POST /api/agents/:id/stop — hard-stop on Mac (cancels jobs + kills process).
+ * Body: { remove?: boolean } — remove extra agents from registry (default true for extras).
+ */
+async function handleAgentStop(req, res, id) {
+  if (!authOk(req)) return sendJson(res, 401, { error: "unauthorized" });
+  let body = {};
+  try {
+    const raw = (await readBody(req)).toString("utf8");
+    if (raw.trim()) body = JSON.parse(raw);
+  } catch {
+    body = {};
+  }
+  try {
+    const slot = registry.require(id);
+    // Extras: default remove=true so "close" frees the slot. Main: reset only.
+    const remove = slot.isMain
+      ? false
+      : body.remove !== undefined
+        ? !!body.remove
+        : true;
+    const out = await stopAgentHard(id, { remove });
+    sendJson(res, 200, { ...out, agents: registry.list() });
+  } catch (e) {
+    const code = e?.code === "AGENT_NOT_FOUND" ? 404 : 500;
+    sendJson(res, code, {
+      error: e instanceof Error ? e.message : String(e),
+      code: e?.code || "ERROR",
+    });
+  }
+}
+
+/** DELETE /api/agents/:id — same as stop with remove for extras */
+async function handleAgentDelete(req, res, id) {
+  if (!authOk(req)) return sendJson(res, 401, { error: "unauthorized" });
+  try {
+    const slot = registry.require(id);
+    const out = await stopAgentHard(id, { remove: !slot.isMain });
+    sendJson(res, 200, { ...out, agents: registry.list() });
+  } catch (e) {
+    const code = e?.code === "AGENT_NOT_FOUND" ? 404 : 500;
+    sendJson(res, code, {
+      error: e instanceof Error ? e.message : String(e),
+      code: e?.code || "ERROR",
+    });
+  }
 }
 
 /** POST /api/reset — kill agent + cancel all jobs (phone unstick). */
@@ -2331,7 +2576,8 @@ async function tryLocalSlashCommand(text) {
       "",
       `- **cwd:** \`${CWD}\``,
       `- **agent session:** \`${agent.sessionId || "(starting)"}\``,
-      `- **queue:** ${jobQueue.length} waiting, processing=${queueRunning}`,
+      `- **queue:** ${totalQueueLength()} waiting, processing=${anyQueueRunning()}`,
+      `- **agents:** ${registry.size} / ${registry.maxAgents}`,
       `- **jobs dir:** \`${JOBS_DIR}\``,
       "",
       "This is the phone-bridge agent, not the TUI session on your Mac desktop.",
@@ -2532,7 +2778,7 @@ const server = http.createServer(async (req, res) => {
   if (req.method === "OPTIONS") {
     res.writeHead(204, {
       "Access-Control-Allow-Origin": "*",
-      "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
+      "Access-Control-Allow-Methods": "GET,POST,DELETE,OPTIONS",
       "Access-Control-Allow-Headers": "Authorization, Content-Type",
     });
     res.end();
@@ -2555,6 +2801,20 @@ const server = http.createServer(async (req, res) => {
     }
     if (req.method === "GET" && pathOnly === "/api/tools") {
       return await handleTools(req, res);
+    }
+    if (req.method === "GET" && pathOnly === "/api/agents") {
+      return await handleAgentsList(req, res);
+    }
+    if (req.method === "POST" && pathOnly === "/api/agents") {
+      return await handleAgentCreate(req, res);
+    }
+    const agentStop = pathOnly.match(/^\/api\/agents\/([a-zA-Z0-9_-]+)\/stop$/);
+    if (req.method === "POST" && agentStop) {
+      return await handleAgentStop(req, res, agentStop[1]);
+    }
+    const agentDel = pathOnly.match(/^\/api\/agents\/([a-zA-Z0-9_-]+)$/);
+    if (req.method === "DELETE" && agentDel) {
+      return await handleAgentDelete(req, res, agentDel[1]);
     }
     if (req.method === "GET" && pathOnly === "/api/jobs") {
       return await handleJobsList(req, res);

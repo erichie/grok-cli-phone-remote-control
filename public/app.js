@@ -7,6 +7,17 @@ import {
   shouldShowJobRecovery,
   nextHeaderJobVisibility,
 } from "./thinking-ui.mjs";
+import {
+  normalizeSelectedAgentId,
+  agentStatusLine,
+  agentDotKind,
+  jobPreviewText,
+  jobStatusLabel,
+  jobIsActive,
+  partitionJobs,
+  activityBadgeCount,
+  chatAgentIdPayload,
+} from "./activity-ui.mjs";
 
 const $ = (id) => document.getElementById(id);
 
@@ -19,6 +30,17 @@ const resetBtn = $("reset-btn");
 const headerJobActions = $("header-job-actions");
 const headerGetResult = $("header-get-result");
 const headerStopShow = $("header-stop-show");
+const menuBtn = $("menu-btn");
+const menuBadge = $("menu-badge");
+const activityDrawer = $("activity-drawer");
+const activityBackdrop = $("activity-backdrop");
+const activityClose = $("activity-close");
+const activitySpawn = $("activity-spawn");
+const activityRefresh = $("activity-refresh");
+const activityAgents = $("activity-agents");
+const activityJobs = $("activity-jobs");
+const agentChipBar = $("agent-chip-bar");
+const agentChip = $("agent-chip");
 const secretInput = $("secret");
 const unlockBtn = $("unlock");
 const input = $("input");
@@ -34,11 +56,15 @@ const pickLibrary = $("pick-library");
 const pickCamera = $("pick-camera");
 const attachCancel = $("attach-cancel");
 
+/** Base key — actual storage is per-agent: `${HISTORY_KEY}:${agentId}`. */
 const HISTORY_KEY = "phone_chat_history_v1";
 const CONVERSATION_ID_KEY = "phone_chat_conversation_id";
+const SELECTED_AGENT_KEY = "phone_chat_selected_agent";
 const MAX_HISTORY = 80;
 /** Cap total stored image data (~2MB JSON safety for localStorage) */
 const MAX_IMAGE_CHARS = 1_800_000;
+/** Poll menu badge + agent list while connected. */
+const ACTIVITY_POLL_MS = 4000;
 
 /** @type {{ mimeType: string, data: string, previewUrl: string }[]} */
 let pendingImages = [];
@@ -47,25 +73,111 @@ let busy = false;
 /** @type {{ role: 'user'|'bot', text: string, images?: string[], tools?: string, jobId?: string, jobStatus?: string }[]} */
 let history = [];
 
-function getStoredConversationId() {
-  return localStorage.getItem(CONVERSATION_ID_KEY) || "";
-}
-function setStoredConversationId(id) {
-  if (id) localStorage.setItem(CONVERSATION_ID_KEY, id);
-  else localStorage.removeItem(CONVERSATION_ID_KEY);
+/** @type {import('./activity-ui.mjs').AgentInfo[]} */
+let knownAgents = [];
+/** @type {import('./activity-ui.mjs').JobInfo[]} */
+let knownJobs = [];
+/** Selected session / send target: "main" | agent uuid (not "auto" for history) */
+let selectedAgentId =
+  localStorage.getItem(SELECTED_AGENT_KEY) || "main";
+/** @type {ReturnType<typeof setInterval> | null} */
+let activityPollTimer = null;
+let activityOpen = false;
+let activityBusy = false;
+
+/** Normalize agent id used for local history buckets. */
+function historyAgentId(agentId) {
+  const id = String(agentId || "main").trim() || "main";
+  if (id === "default" || id === "auto") return "main";
+  return id;
 }
 
-/** Wipe phone UI history (after /clear or Reset on Mac). */
+function historyStorageKey(agentId = selectedAgentId) {
+  return `${HISTORY_KEY}:${historyAgentId(agentId)}`;
+}
+
+function conversationStorageKey(agentId = selectedAgentId) {
+  return `${CONVERSATION_ID_KEY}:${historyAgentId(agentId)}`;
+}
+
+/** One-time: move pre-multi-agent history into main's bucket. */
+function migrateLegacyHistory() {
+  try {
+    const legacy = localStorage.getItem(HISTORY_KEY);
+    const mainKey = historyStorageKey("main");
+    if (legacy && !localStorage.getItem(mainKey)) {
+      localStorage.setItem(mainKey, legacy);
+    }
+    const legacyConv = localStorage.getItem(CONVERSATION_ID_KEY);
+    const mainConv = conversationStorageKey("main");
+    if (legacyConv && !localStorage.getItem(mainConv)) {
+      localStorage.setItem(mainConv, legacyConv);
+    }
+  } catch {
+    /* ignore */
+  }
+}
+migrateLegacyHistory();
+
+function getStoredConversationId(agentId = selectedAgentId) {
+  try {
+    return localStorage.getItem(conversationStorageKey(agentId)) || "";
+  } catch {
+    return "";
+  }
+}
+function setStoredConversationId(id, agentId = selectedAgentId) {
+  try {
+    const key = conversationStorageKey(agentId);
+    if (id) localStorage.setItem(key, id);
+    else localStorage.removeItem(key);
+  } catch {
+    /* ignore */
+  }
+}
+
+/** Wipe phone UI history for the current agent session only. */
 function clearLocalChatHistory() {
   history = [];
   try {
-    localStorage.removeItem(HISTORY_KEY);
+    localStorage.removeItem(historyStorageKey());
   } catch {
     /* ignore */
   }
   if (messages) messages.innerHTML = "";
   for (const [jobId] of activePolls) stopJobPoll(jobId);
   clearHeaderJobActions();
+}
+
+/** Wipe every agent session's phone history (Reset). */
+function clearAllAgentHistories() {
+  history = [];
+  try {
+    const toRemove = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (
+        k === HISTORY_KEY ||
+        k === CONVERSATION_ID_KEY ||
+        (k && k.startsWith(HISTORY_KEY + ":")) ||
+        (k && k.startsWith(CONVERSATION_ID_KEY + ":"))
+      ) {
+        toRemove.push(k);
+      }
+    }
+    for (const k of toRemove) localStorage.removeItem(k);
+  } catch {
+    /* ignore */
+  }
+  if (messages) messages.innerHTML = "";
+  for (const [jobId] of activePolls) stopJobPoll(jobId);
+  clearHeaderJobActions();
+}
+
+/** Active Mac jobs for the currently selected agent session. */
+function jobsForSelectedAgent(jobs = knownJobs) {
+  const aid = historyAgentId(selectedAgentId);
+  return (jobs || []).filter((j) => historyAgentId(j.agentId || "main") === aid);
 }
 
 /** @type {{ id: string, slash: string, label: string, description: string, insert: string }[]} */
@@ -305,9 +417,9 @@ function setBodyContent(el, text, role) {
   }
 }
 
-function loadHistory() {
+function loadHistory(agentId = selectedAgentId) {
   try {
-    const raw = localStorage.getItem(HISTORY_KEY);
+    const raw = localStorage.getItem(historyStorageKey(agentId));
     if (!raw) return [];
     const parsed = JSON.parse(raw);
     return Array.isArray(parsed) ? parsed : [];
@@ -316,15 +428,18 @@ function loadHistory() {
   }
 }
 
-function persistHistory() {
+function persistHistory(agentId = selectedAgentId) {
   try {
+    const key = historyStorageKey(agentId);
     // trim oldest until it fits
     let slice = history.slice(-MAX_HISTORY);
     for (let attempt = 0; attempt < 20; attempt++) {
       const json = JSON.stringify(slice);
       try {
-        localStorage.setItem(HISTORY_KEY, json);
-        history = slice;
+        localStorage.setItem(key, json);
+        if (historyAgentId(agentId) === historyAgentId(selectedAgentId)) {
+          history = slice;
+        }
         return;
       } catch {
         // quota — drop oldest, or strip images from oldest
@@ -955,6 +1070,8 @@ async function onForegroundResume() {
   try {
     const host = await loadHostConversation();
     if (host) {
+      if (Array.isArray(host.activeJobs)) knownJobs = host.activeJobs;
+      if (Array.isArray(host.agents)) knownAgents = host.agents;
       const prevLen = history.length;
       const prevId = getStoredConversationId();
       applyHostConversation(host);
@@ -965,7 +1082,7 @@ async function onForegroundResume() {
       ) {
         renderHistory();
       }
-      reattachActiveJobs(host.activeJobs || []);
+      reattachActiveJobs(jobsForSelectedAgent(host.activeJobs || knownJobs));
     }
   } catch {
     /* offline */
@@ -1020,10 +1137,495 @@ async function fileToImage(file) {
   };
 }
 
+// ── Left menu: agents + jobs (Activity) ─────────────────────────────────────
+
+/**
+ * Switch the active session: saves current chat, loads that agent's history.
+ * Tap an agent card to call this (no separate "Send here" button).
+ * @param {string} id
+ * @param {{ closeMenu?: boolean }} [opts]
+ */
+function setSelectedAgentId(id, opts = {}) {
+  const next = historyAgentId(
+    normalizeSelectedAgentId(knownAgents, id || "main")
+  );
+  const prev = historyAgentId(selectedAgentId);
+  if (next === prev) {
+    updateAgentChip();
+    if (activityOpen) renderActivityAgents();
+    if (opts.closeMenu) closeActivityMenu();
+    return;
+  }
+
+  // Persist outgoing session, then load the new one
+  persistHistory(prev);
+  for (const [jobId] of activePolls) stopJobPoll(jobId);
+  clearHeaderJobActions();
+
+  selectedAgentId = next;
+  try {
+    localStorage.setItem(SELECTED_AGENT_KEY, selectedAgentId);
+  } catch {
+    /* ignore */
+  }
+
+  history = loadHistory(next);
+  // Rehydrate unfinished jobs for this agent into the transcript
+  const agentJobs = jobsForSelectedAgent(knownJobs);
+  history = ensureActiveJobBotMessages(history, agentJobs);
+  renderHistory();
+  reattachActiveJobs(agentJobs);
+  updateAgentChip();
+  if (activityOpen) renderActivityAgents();
+  if (opts.closeMenu !== false) closeActivityMenu();
+}
+
+function updateAgentChip() {
+  if (!agentChip || !agentChipBar) return;
+  const id = normalizeSelectedAgentId(knownAgents, selectedAgentId);
+  if (id !== selectedAgentId) selectedAgentId = id;
+  const agent = knownAgents.find((a) => a.id === id);
+  const label =
+    id === "auto"
+      ? "Auto (idle)"
+      : agent?.label || (id === "main" ? "Main" : id.slice(0, 8));
+  agentChip.textContent = label;
+  const busy =
+    !!agent && (agent.processing || !!agent.currentJobId || (agent.queueLength || 0) > 0);
+  agentChip.classList.toggle("busy", busy);
+  // Show chip when chat is visible
+  const show = chat && chat.classList.contains("active");
+  agentChipBar.classList.toggle("hidden", !show);
+}
+
+function updateMenuBadge() {
+  if (!menuBadge) return;
+  const n = activityBadgeCount(knownJobs, knownAgents);
+  if (n > 0) {
+    menuBadge.textContent = n > 99 ? "99+" : String(n);
+    menuBadge.classList.remove("hidden");
+    menuBadge.setAttribute("aria-hidden", "false");
+  } else {
+    menuBadge.textContent = "0";
+    menuBadge.classList.add("hidden");
+    menuBadge.setAttribute("aria-hidden", "true");
+  }
+}
+
+function openActivityMenu() {
+  if (!activityDrawer) return;
+  activityOpen = true;
+  activityDrawer.classList.remove("hidden");
+  activityDrawer.setAttribute("aria-hidden", "false");
+  if (menuBtn) menuBtn.setAttribute("aria-expanded", "true");
+  void refreshActivity({ force: true });
+}
+
+function closeActivityMenu() {
+  if (!activityDrawer) return;
+  activityOpen = false;
+  activityDrawer.classList.add("hidden");
+  activityDrawer.setAttribute("aria-hidden", "true");
+  if (menuBtn) menuBtn.setAttribute("aria-expanded", "false");
+}
+
+function toggleActivityMenu() {
+  if (activityOpen) closeActivityMenu();
+  else openActivityMenu();
+}
+
+function startActivityPoll() {
+  stopActivityPoll();
+  activityPollTimer = setInterval(() => {
+    void refreshActivity({ quiet: true });
+  }, ACTIVITY_POLL_MS);
+  void refreshActivity({ quiet: true });
+}
+
+function stopActivityPoll() {
+  if (activityPollTimer) {
+    clearInterval(activityPollTimer);
+    activityPollTimer = null;
+  }
+}
+
+/**
+ * Fetch agents + jobs from the Mac. Updates badge always; full list when menu open.
+ * @param {{ quiet?: boolean, force?: boolean }} [opts]
+ */
+async function refreshActivity(opts = {}) {
+  const secret = getSecret();
+  if (!secret) return;
+  if (activityBusy && !opts.force) return;
+  activityBusy = true;
+  try {
+    const res = await fetch("/api/jobs", {
+      headers: { Authorization: `Bearer ${secret}` },
+      cache: "no-store",
+    });
+    if (!res.ok) return;
+    const j = await res.json();
+    knownJobs = Array.isArray(j.jobs) ? j.jobs : [];
+    knownAgents = Array.isArray(j.agents) ? j.agents : knownAgents;
+    const nextSel = historyAgentId(
+      normalizeSelectedAgentId(knownAgents, selectedAgentId)
+    );
+    // Agent was removed on Mac — fall back to main and swap chat history
+    if (nextSel !== historyAgentId(selectedAgentId)) {
+      setSelectedAgentId(nextSel, { closeMenu: false });
+    } else {
+      selectedAgentId = nextSel;
+      updateMenuBadge();
+      updateAgentChip();
+    }
+    if (activityOpen || opts.force) {
+      renderActivityAgents();
+      renderActivityJobs();
+    }
+  } catch {
+    /* offline — leave last snapshot */
+  } finally {
+    activityBusy = false;
+  }
+}
+
+function renderActivityAgents() {
+  if (!activityAgents) return;
+  activityAgents.innerHTML = "";
+  const list = knownAgents.length
+    ? knownAgents
+    : [{ id: "main", label: "Main", isMain: true, alive: false }];
+  const currentId = historyAgentId(selectedAgentId);
+  for (const agent of list) {
+    const isSelected = historyAgentId(agent.id) === currentId;
+    const card = document.createElement("div");
+    card.className = "activity-card selectable" + (isSelected ? " selected" : "");
+    card.setAttribute("role", "button");
+    card.tabIndex = 0;
+    card.setAttribute(
+      "aria-label",
+      isSelected
+        ? `${agent.label || "Main"} — current session`
+        : `Switch to ${agent.label || agent.id}`
+    );
+    card.onclick = (e) => {
+      // Ignore clicks on action buttons (Stop)
+      if (e.target.closest(".activity-action")) return;
+      setSelectedAgentId(agent.id, { closeMenu: true });
+    };
+    card.onkeydown = (e) => {
+      if (e.key === "Enter" || e.key === " ") {
+        e.preventDefault();
+        setSelectedAgentId(agent.id, { closeMenu: true });
+      }
+    };
+
+    const top = document.createElement("div");
+    top.className = "activity-card-top";
+    const title = document.createElement("div");
+    title.className = "activity-card-title";
+    const dot = document.createElement("span");
+    dot.className = `activity-dot ${agentDotKind(agent)}`;
+    const name = document.createElement("span");
+    name.className = "name";
+    name.textContent = agent.label || (agent.isMain ? "Main" : agent.id.slice(0, 8));
+    title.append(dot, name);
+    top.appendChild(title);
+    if (isSelected) {
+      const pill = document.createElement("span");
+      pill.className = "activity-pill running";
+      pill.textContent = "Current";
+      top.appendChild(pill);
+    }
+
+    const meta = document.createElement("div");
+    meta.className = "activity-meta";
+    const pid = agent.pid ? ` · pid ${agent.pid}` : "";
+    const turnHint = (() => {
+      try {
+        const n = loadHistory(agent.id).length;
+        if (!n) return " · empty chat";
+        return ` · ${n} msg${n === 1 ? "" : "s"} on phone`;
+      } catch {
+        return "";
+      }
+    })();
+    meta.textContent = `${agentStatusLine(agent)}${pid}${turnHint}`;
+
+    const actions = document.createElement("div");
+    actions.className = "activity-actions";
+
+    const stopBtn = document.createElement("button");
+    stopBtn.type = "button";
+    stopBtn.className = "activity-action danger";
+    stopBtn.textContent = agent.isMain ? "Stop & reset" : "Stop & close";
+    stopBtn.onclick = (e) => {
+      e.stopPropagation();
+      void stopAgentFromMenu(agent);
+    };
+    actions.appendChild(stopBtn);
+
+    card.append(top, meta, actions);
+    activityAgents.appendChild(card);
+  }
+}
+
+function renderActivityJobs() {
+  if (!activityJobs) return;
+  activityJobs.innerHTML = "";
+  const { active, recent } = partitionJobs(knownJobs);
+  if (!active.length && !recent.length) {
+    const empty = document.createElement("div");
+    empty.className = "activity-empty";
+    empty.textContent = "No jobs yet.";
+    activityJobs.appendChild(empty);
+    return;
+  }
+  if (active.length) {
+    const head = document.createElement("div");
+    head.className = "activity-subhead";
+    head.textContent = "Active";
+    activityJobs.appendChild(head);
+    for (const job of active) activityJobs.appendChild(jobCard(job));
+  }
+  if (recent.length) {
+    const head = document.createElement("div");
+    head.className = "activity-subhead";
+    head.textContent = "Recent";
+    activityJobs.appendChild(head);
+    for (const job of recent) activityJobs.appendChild(jobCard(job));
+  }
+}
+
+function jobCard(job) {
+  const card = document.createElement("div");
+  card.className = "activity-card";
+
+  const top = document.createElement("div");
+  top.className = "activity-card-top";
+  const title = document.createElement("div");
+  title.className = "activity-card-title";
+  const name = document.createElement("span");
+  name.className = "name";
+  name.textContent = job.agentLabel || job.agentId || "Main";
+  title.appendChild(name);
+  const pill = document.createElement("span");
+  pill.className = `activity-pill ${job.status || ""}`;
+  pill.textContent = jobStatusLabel(job);
+  top.append(title, pill);
+
+  const preview = document.createElement("div");
+  preview.className = "activity-preview";
+  preview.textContent = jobPreviewText(job);
+
+  card.append(top, preview);
+
+  if (jobIsActive(job)) {
+    const actions = document.createElement("div");
+    actions.className = "activity-actions";
+
+    const stopShow = document.createElement("button");
+    stopShow.type = "button";
+    stopShow.className = "activity-action primary";
+    stopShow.textContent = "Stop & show";
+    stopShow.onclick = () => void finalizeJobFromMenu(job.id);
+
+    const cancel = document.createElement("button");
+    cancel.type = "button";
+    cancel.className = "activity-action danger";
+    cancel.textContent = "Cancel";
+    cancel.onclick = () => void cancelJobFromMenu(job.id);
+
+    actions.append(stopShow, cancel);
+    card.appendChild(actions);
+  }
+
+  return card;
+}
+
+async function spawnAgentFromMenu() {
+  const secret = getSecret();
+  if (!secret) {
+    showGate();
+    return;
+  }
+  if (activitySpawn) activitySpawn.disabled = true;
+  try {
+    const res = await fetch("/api/agents", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${secret}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({}),
+    });
+    const j = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(j.error || res.statusText);
+    if (Array.isArray(j.agents)) knownAgents = j.agents;
+    else if (j.agent) {
+      knownAgents = [
+        ...knownAgents.filter((a) => a.id !== j.agent.id),
+        j.agent,
+      ];
+    }
+    // Switch into the new agent session (its own empty chat history)
+    if (j.agent?.id) {
+      setSelectedAgentId(j.agent.id, { closeMenu: true });
+    } else {
+      updateMenuBadge();
+      renderActivityAgents();
+      updateAgentChip();
+    }
+  } catch (e) {
+    alert(`Could not start agent: ${e.message || e}`);
+  } finally {
+    if (activitySpawn) activitySpawn.disabled = false;
+  }
+}
+
+/**
+ * Hard-stop agent on the Mac (cancels jobs + kills process / process group).
+ * Extras are removed; main is reset.
+ */
+async function stopAgentFromMenu(agent) {
+  const secret = getSecret();
+  if (!secret || !agent?.id) return;
+  const label = agent.label || agent.id;
+  const msg = agent.isMain
+    ? `Stop & reset Main on the Mac?\n\nCancels Main's jobs and restarts the agent process.`
+    : `Stop & close "${label}" on the Mac?\n\nCancels its jobs and kills the process (including child shells).`;
+  if (!confirm(msg)) return;
+  try {
+    const res = await fetch(`/api/agents/${encodeURIComponent(agent.id)}/stop`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${secret}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ remove: !agent.isMain }),
+    });
+    const j = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(j.error || res.statusText);
+    if (Array.isArray(j.agents)) knownAgents = j.agents;
+    // Drop local history for a removed extra agent
+    if (!agent.isMain) {
+      try {
+        localStorage.removeItem(historyStorageKey(agent.id));
+        localStorage.removeItem(conversationStorageKey(agent.id));
+      } catch {
+        /* ignore */
+      }
+    }
+    if (historyAgentId(selectedAgentId) === historyAgentId(agent.id)) {
+      if (agent.isMain) {
+        // Main reset — clear main chat on phone
+        clearLocalChatHistory();
+        history = [];
+        renderHistory();
+      } else {
+        setSelectedAgentId("main", { closeMenu: false });
+      }
+    }
+    // Drop local polls for jobs on this agent
+    for (const job of knownJobs) {
+      if (
+        historyAgentId(job.agentId || "main") === historyAgentId(agent.id) &&
+        jobIsActive(job)
+      ) {
+        stopJobPoll(job.id);
+      }
+    }
+    await refreshActivity({ force: true });
+  } catch (e) {
+    alert(`Stop failed: ${e.message || e}`);
+  }
+}
+
+async function cancelJobFromMenu(jobId) {
+  const secret = getSecret();
+  if (!secret || !jobId) return;
+  if (!confirm("Cancel this job on the Mac?\n\nStops work and frees the agent queue.")) {
+    return;
+  }
+  try {
+    const res = await fetch(`/api/jobs/${encodeURIComponent(jobId)}/cancel`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${secret}` },
+    });
+    const j = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(j.error || res.statusText);
+    stopJobPoll(jobId);
+    // Update chat bubble if present
+    const msgEl = messages?.querySelector(`.msg.bot[data-job-id="${jobId}"]`);
+    const bodyEl = msgEl?.querySelector(".body");
+    const thinkingEl = msgEl?.querySelector(".thinking");
+    if (thinkingEl) setThinking(thinkingEl, { hide: true });
+    if (bodyEl) {
+      setBodyContent(bodyEl, j.reply || "_(cancelled)_", "bot");
+    }
+    clearHeaderJobActions();
+    await refreshActivity({ force: true });
+  } catch (e) {
+    alert(`Cancel failed: ${e.message || e}`);
+  }
+}
+
+async function finalizeJobFromMenu(jobId) {
+  const secret = getSecret();
+  if (!secret || !jobId) return;
+  try {
+    const res = await fetch(`/api/jobs/${encodeURIComponent(jobId)}/finalize`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${secret}` },
+    });
+    const j = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(j.error || res.statusText);
+    stopJobPoll(jobId);
+    const msgEl = messages?.querySelector(`.msg.bot[data-job-id="${jobId}"]`);
+    const bodyEl = msgEl?.querySelector(".body");
+    const thinkingEl = msgEl?.querySelector(".thinking");
+    if (thinkingEl) setThinking(thinkingEl, { hide: true });
+    if (bodyEl) {
+      setBodyContent(bodyEl, j.reply || "_(Stopped — no reply yet.)_", "bot");
+    }
+    clearHeaderJobActions();
+    await refreshActivity({ force: true });
+  } catch (e) {
+    alert(`Stop failed: ${e.message || e}`);
+  }
+}
+
+function cycleSendTarget() {
+  const ids = knownAgents.map((a) => a.id);
+  if (!ids.length) ids.push("main");
+  const cur = historyAgentId(selectedAgentId);
+  const idx = ids.findIndex((id) => historyAgentId(id) === cur);
+  const next = ids[(idx + 1) % ids.length] || "main";
+  setSelectedAgentId(next, { closeMenu: false });
+}
+
+if (menuBtn) menuBtn.onclick = () => toggleActivityMenu();
+if (activityClose) activityClose.onclick = () => closeActivityMenu();
+if (activityBackdrop) activityBackdrop.onclick = () => closeActivityMenu();
+if (activitySpawn) activitySpawn.onclick = () => void spawnAgentFromMenu();
+if (activityRefresh) activityRefresh.onclick = () => void refreshActivity({ force: true });
+if (agentChip) agentChip.onclick = () => {
+  if (knownAgents.length > 1) cycleSendTarget();
+  else openActivityMenu();
+};
+
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && activityOpen) {
+    e.preventDefault();
+    closeActivityMenu();
+  }
+});
+
 async function checkStatus() {
   const secret = getSecret();
   if (!secret) {
     setConn("locked", "bad");
+    stopActivityPoll();
     return false;
   }
   try {
@@ -1032,13 +1634,22 @@ async function checkStatus() {
     });
     if (!res.ok) {
       setConn("auth failed", "bad");
+      stopActivityPoll();
       return false;
     }
     const j = await res.json();
+    if (Array.isArray(j.agents)) {
+      knownAgents = j.agents;
+      selectedAgentId = normalizeSelectedAgentId(knownAgents, selectedAgentId);
+      updateAgentChip();
+      updateMenuBadge();
+    }
     setConn(j.agentReady ? "connected" : "starting…", j.agentReady ? "ok" : "");
+    startActivityPoll();
     return true;
   } catch {
     setConn("offline", "bad");
+    stopActivityPoll();
     return false;
   }
 }
@@ -1090,15 +1701,27 @@ function reattachActiveJobs(activeJobs) {
 }
 
 /**
- * Apply host conversation as source of truth.
- * New conversationId (after /clear or Reset) replaces local history entirely
- * so old usage/test turns never re-append at the bottom.
+ * Apply host conversation as source of truth for the **main** agent only.
+ * Extra concurrent agents keep phone-local histories (unique per agent).
  * @param {object} host
  */
 function applyHostConversation(host) {
   if (!host) return;
+  const aid = historyAgentId(selectedAgentId);
+  const agentJobs = (host.activeJobs || []).filter(
+    (j) => historyAgentId(j.agentId || "main") === aid
+  );
+
+  // Non-main sessions: phone-local history only + rehydrate this agent's jobs
+  if (aid !== "main") {
+    history = loadHistory(aid);
+    history = ensureActiveJobBotMessages(history, agentJobs);
+    persistHistory(aid);
+    return;
+  }
+
   const hostId = host.conversationId || "";
-  const prevId = getStoredConversationId();
+  const prevId = getStoredConversationId("main");
   const hostMsgs = Array.isArray(host.messages) ? host.messages : [];
   const epochChanged = !!(hostId && prevId && hostId !== prevId);
   const freshEpoch = !!(hostId && !prevId && host.clearedAt);
@@ -1106,35 +1729,54 @@ function applyHostConversation(host) {
   if (epochChanged || freshEpoch) {
     // Mac started a new conversation — discard local copy
     history = mergeHostHistory([], hostMsgs, MAX_HISTORY);
-  } else if (hostMsgs.length || host.activeJobs?.length) {
-    history = mergeHostHistory(loadHistory(), hostMsgs, MAX_HISTORY);
+  } else if (hostMsgs.length || agentJobs.length) {
+    history = mergeHostHistory(loadHistory("main"), hostMsgs, MAX_HISTORY);
   } else if (hostId && host.clearedAt) {
     // Explicit empty transcript after clear
     history = [];
   } else {
-    history = loadHistory();
+    history = loadHistory("main");
   }
 
-  history = ensureActiveJobBotMessages(history, host.activeJobs || []);
-  if (hostId) setStoredConversationId(hostId);
-  persistHistory();
+  history = ensureActiveJobBotMessages(history, agentJobs);
+  if (hostId) setStoredConversationId(hostId, "main");
+  persistHistory("main");
 }
 
 async function showChat() {
   gate.classList.add("hidden");
   chat.classList.add("active");
-  // Host-backed history first — like remote-control apps that always restore session text
+  // Host-backed history first for main; extras use per-agent localStorage
   const host = await loadHostConversation();
+  if (Array.isArray(host?.agents)) {
+    knownAgents = host.agents;
+    selectedAgentId = historyAgentId(
+      normalizeSelectedAgentId(knownAgents, selectedAgentId)
+    );
+  }
+  if (Array.isArray(host?.activeJobs)) {
+    knownJobs = host.activeJobs;
+  }
   if (host) applyHostConversation(host);
   else history = loadHistory();
   renderHistory();
-  reattachActiveJobs(host?.activeJobs || []);
+  reattachActiveJobs(
+    (host?.activeJobs || []).filter(
+      (j) =>
+        historyAgentId(j.agentId || "main") === historyAgentId(selectedAgentId)
+    )
+  );
+  updateAgentChip();
   checkStatus();
+  startActivityPoll();
 }
 
 function showGate() {
   chat.classList.remove("active");
   gate.classList.remove("hidden");
+  stopActivityPoll();
+  closeActivityMenu();
+  if (agentChipBar) agentChipBar.classList.add("hidden");
 }
 
 async function doUnlock() {
@@ -1397,6 +2039,7 @@ async function send() {
       body: JSON.stringify({
         text,
         images: imgs.map(({ mimeType, data }) => ({ mimeType, data })),
+        agentId: chatAgentIdPayload(selectedAgentId),
       }),
     });
     const j = await res.json().catch(() => ({}));
@@ -1418,8 +2061,13 @@ async function send() {
 
     const jobId = j.jobId;
     const isQueued = j.status === "queued" && (j.queuePosition || 0) > 0;
+    const agentHint = j.agentLabel || j.agentId;
     setThinking(thinkingEl, {
-      phase: isQueued ? `Queued (#${j.queuePosition})` : "Thinking…",
+      phase: isQueued
+        ? `Queued (#${j.queuePosition})${agentHint ? ` · ${agentHint}` : ""}`
+        : agentHint && agentHint !== "Main"
+          ? `Thinking… · ${agentHint}`
+          : "Thinking…",
       jobId,
     });
     attachJobIdToLatestPair(jobId);
@@ -1432,9 +2080,13 @@ async function send() {
       }
     }
     const botEl = body.closest(".msg");
-    if (botEl) botEl.dataset.jobId = jobId;
+    if (botEl) {
+      botEl.dataset.jobId = jobId;
+      if (j.agentId) botEl.dataset.agentId = j.agentId;
+    }
 
     startJobPoll(jobId, body, thinkingEl);
+    void refreshActivity({ quiet: true });
   } catch (e) {
     setThinking(thinkingEl, { hide: true });
     setBodyContent(
@@ -1495,14 +2147,28 @@ async function resetAgent() {
     const j = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(j.error || res.statusText);
 
-    // New conversation epoch on Mac — wipe phone UI history too
-    clearLocalChatHistory();
-    if (j.conversationId) setStoredConversationId(j.conversationId);
+    // New conversation epoch on Mac — wipe all per-agent phone histories
+    clearAllAgentHistories();
+    selectedAgentId = "main";
+    try {
+      localStorage.setItem(SELECTED_AGENT_KEY, "main");
+    } catch {
+      /* ignore */
+    }
+    if (j.conversationId) setStoredConversationId(j.conversationId, "main");
+    if (Array.isArray(j.agents)) knownAgents = j.agents;
+    knownJobs = [];
+    history = [];
+    renderHistory();
+    updateMenuBadge();
+    updateAgentChip();
+    closeActivityMenu();
     setConn("connected", "ok");
     addMsg("bot", "_Agent reset. Chat history cleared. You can send a new message._", {
       jobStatus: "done",
       showThinking: false,
     });
+    void refreshActivity({ force: true });
   } catch (e) {
     setConn("offline", "bad");
     alert(`Reset failed: ${e.message || e}`);
