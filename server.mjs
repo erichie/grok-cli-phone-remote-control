@@ -2352,6 +2352,46 @@ async function handleAgentCreate(req, res) {
 }
 
 /**
+ * PATCH /api/agents/:id — rename (and future metadata).
+ * Body: { label: string }
+ * Also accepted as POST /api/agents/:id/rename for simple clients.
+ */
+async function handleAgentRename(req, res, id) {
+  if (!authOk(req)) return sendJson(res, 401, { error: "unauthorized" });
+  let body = {};
+  try {
+    const raw = (await readBody(req)).toString("utf8");
+    if (raw.trim()) body = JSON.parse(raw);
+  } catch (e) {
+    if (e && e.code === "BODY_TOO_LARGE") {
+      return sendJson(res, 413, { error: e.message });
+    }
+    return sendJson(res, 400, { error: "invalid json" });
+  }
+  if (body.label === undefined || body.label === null) {
+    return sendJson(res, 400, {
+      error: "label is required",
+      code: "INVALID_LABEL",
+    });
+  }
+  try {
+    const agent = registry.rename(id, body.label);
+    sendJson(res, 200, { agent, agents: registry.list() });
+  } catch (e) {
+    const code =
+      e?.code === "AGENT_NOT_FOUND"
+        ? 404
+        : e?.code === "INVALID_LABEL"
+          ? 400
+          : 500;
+    sendJson(res, code, {
+      error: e instanceof Error ? e.message : String(e),
+      code: e?.code || "ERROR",
+    });
+  }
+}
+
+/**
  * POST /api/agents/:id/stop — hard-stop on Mac (cancels jobs + kills process).
  * Body: { remove?: boolean } — remove extra agents from registry (default true for extras).
  */
@@ -2778,7 +2818,7 @@ const server = http.createServer(async (req, res) => {
   if (req.method === "OPTIONS") {
     res.writeHead(204, {
       "Access-Control-Allow-Origin": "*",
-      "Access-Control-Allow-Methods": "GET,POST,DELETE,OPTIONS",
+      "Access-Control-Allow-Methods": "GET,POST,PATCH,DELETE,OPTIONS",
       "Access-Control-Allow-Headers": "Authorization, Content-Type",
     });
     res.end();
@@ -2811,6 +2851,16 @@ const server = http.createServer(async (req, res) => {
     const agentStop = pathOnly.match(/^\/api\/agents\/([a-zA-Z0-9_-]+)\/stop$/);
     if (req.method === "POST" && agentStop) {
       return await handleAgentStop(req, res, agentStop[1]);
+    }
+    const agentRename = pathOnly.match(
+      /^\/api\/agents\/([a-zA-Z0-9_-]+)\/rename$/
+    );
+    if (req.method === "POST" && agentRename) {
+      return await handleAgentRename(req, res, agentRename[1]);
+    }
+    const agentPatch = pathOnly.match(/^\/api\/agents\/([a-zA-Z0-9_-]+)$/);
+    if (req.method === "PATCH" && agentPatch) {
+      return await handleAgentRename(req, res, agentPatch[1]);
     }
     const agentDel = pathOnly.match(/^\/api\/agents\/([a-zA-Z0-9_-]+)$/);
     if (req.method === "DELETE" && agentDel) {

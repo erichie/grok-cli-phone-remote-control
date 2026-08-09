@@ -148,15 +148,68 @@ export function partitionJobs(jobs, opts = {}) {
 }
 
 /**
- * Count badge for the Activity header button.
+ * True when a job has finished its turn (success, error, or cancel).
+ * @param {JobInfo|null|undefined} job
+ * @returns {boolean}
+ */
+export function jobIsTerminal(job) {
+  const st = job?.status || "";
+  return st === "done" || st === "error" || st === "cancelled";
+}
+
+/**
+ * True when an agent is idle and can take a new user message.
+ * @param {AgentInfo|null|undefined} agent
+ * @returns {boolean}
+ */
+export function agentIsReadyForUser(agent) {
+  if (!agent) return false;
+  if (agent.processing || agent.currentJobId) return false;
+  if ((agent.queueLength || 0) > 0) return false;
+  return !!(agent.alive || agent.agentReady || agent.isMain);
+}
+
+/**
+ * Menu badge: only agents that finished a recent turn and are idle
+ * (ready for the user). Never inventory of extras or in-flight jobs.
+ *
  * @param {JobInfo[]} jobs
  * @param {AgentInfo[]} agents
+ * @param {{
+ *   selectedAgentId?: string|null,
+ *   now?: number,
+ *   readyWindowMs?: number,
+ * }} [opts]
  * @returns {number}
  */
-export function activityBadgeCount(jobs, agents) {
-  const activeJobs = (jobs || []).filter((j) => jobIsActive(j)).length;
-  const extraAgents = (agents || []).filter((a) => !a.isMain).length;
-  return activeJobs + extraAgents;
+export function activityBadgeCount(jobs, agents, opts = {}) {
+  const now = opts.now ?? Date.now();
+  const readyWindowMs = opts.readyWindowMs ?? 30 * 60 * 1000;
+  const selectedId = opts.selectedAgentId
+    ? String(opts.selectedAgentId)
+    : null;
+
+  /** @type {Map<string, number>} agentId → latest finishedAt ms */
+  const latestFinished = new Map();
+  for (const j of jobs || []) {
+    if (!jobIsTerminal(j)) continue;
+    const aid = String(j.agentId || "main");
+    const t = Date.parse(j.finishedAt || j.updatedAt || 0) || 0;
+    if (!t || now - t > readyWindowMs) continue;
+    const prev = latestFinished.get(aid) || 0;
+    if (t > prev) latestFinished.set(aid, t);
+  }
+
+  let count = 0;
+  for (const a of agents || []) {
+    if (!a?.id) continue;
+    // User is already in this chat — no badge nag
+    if (selectedId && a.id === selectedId) continue;
+    if (!agentIsReadyForUser(a)) continue;
+    if (!latestFinished.has(a.id)) continue;
+    count++;
+  }
+  return count;
 }
 
 /**

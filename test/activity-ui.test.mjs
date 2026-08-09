@@ -96,14 +96,74 @@ test("partitionJobs splits active vs recent", () => {
   );
 });
 
-test("activityBadgeCount = active jobs + extra agents", () => {
-  const jobs = [
-    { id: "1", status: "running" },
-    { id: "2", status: "done" },
-    { id: "3", status: "queued" },
+test("activityBadgeCount only counts idle agents with a recent finished turn", () => {
+  const now = Date.parse("2026-08-09T15:00:00.000Z");
+  const readyAgents = [
+    {
+      id: "main",
+      label: "Main",
+      isMain: true,
+      alive: true,
+      agentReady: true,
+      processing: false,
+      queueLength: 0,
+    },
+    {
+      id: "aaaa-bbbb",
+      label: "Agent 1",
+      isMain: false,
+      alive: true,
+      agentReady: true,
+      processing: false,
+      currentJobId: null,
+      queueLength: 0,
+    },
   ];
-  assert.equal(activityBadgeCount(jobs, agents), 2 + 1);
-  assert.equal(activityBadgeCount([], [{ id: "main", isMain: true }]), 0);
+  const jobs = [
+    {
+      id: "1",
+      status: "running",
+      agentId: "main",
+      updatedAt: "2026-08-09T14:59:00.000Z",
+    },
+    {
+      id: "2",
+      status: "done",
+      agentId: "aaaa-bbbb",
+      finishedAt: "2026-08-09T14:55:00.000Z",
+    },
+    {
+      id: "3",
+      status: "queued",
+      agentId: "main",
+    },
+  ];
+  // Only Agent 1 finished + idle; main is still working (running job / not ready)
+  assert.equal(
+    activityBadgeCount(jobs, readyAgents, { now, selectedAgentId: "main" }),
+    1
+  );
+  // Viewing that agent clears the badge
+  assert.equal(
+    activityBadgeCount(jobs, readyAgents, {
+      now,
+      selectedAgentId: "aaaa-bbbb",
+    }),
+    0
+  );
+  // Busy agent does not count even if it has a done job in the list
+  const busy = [
+    {
+      ...readyAgents[1],
+      processing: true,
+      currentJobId: "job-x",
+    },
+  ];
+  assert.equal(
+    activityBadgeCount(jobs, busy, { now, selectedAgentId: "main" }),
+    0
+  );
+  assert.equal(activityBadgeCount([], readyAgents, { now }), 0);
 });
 
 test("chatAgentIdPayload normalizes default", () => {

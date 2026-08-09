@@ -167,6 +167,28 @@ test("require throws AGENT_NOT_FOUND", () => {
   });
 });
 
+test("rename updates label for main and extras", () => {
+  const reg = createAgentRegistry({
+    createAcp: (cwd) => fakeAcp(cwd),
+    defaultCwd: "/tmp",
+  });
+  const main = reg.rename("main", "  Mac workspace  ");
+  assert.equal(main.label, "Mac workspace");
+  const created = reg.create({ label: "Temp" });
+  const renamed = reg.rename(created.id, "Refactor PR");
+  assert.equal(renamed.label, "Refactor PR");
+  assert.equal(reg.list().find((a) => a.id === created.id)?.label, "Refactor PR");
+});
+
+test("rename falls back when label is empty whitespace", () => {
+  const reg = createAgentRegistry({
+    createAcp: (cwd) => fakeAcp(cwd),
+    defaultCwd: "/tmp",
+  });
+  const main = reg.rename("main", "   ");
+  assert.equal(main.label, "Main");
+});
+
 test("killProcessTree is a no-op for null/killed procs", async () => {
   await killProcessTree(null);
   await killProcessTree({ killed: true, pid: 1 });

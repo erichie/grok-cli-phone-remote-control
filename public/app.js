@@ -1200,7 +1200,11 @@ function updateAgentChip() {
 
 function updateMenuBadge() {
   if (!menuBadge) return;
-  const n = activityBadgeCount(knownJobs, knownAgents);
+  // Only when an agent finished a turn and is idle / ready for the user
+  // (not while working, not "you have N agents")
+  const n = activityBadgeCount(knownJobs, knownAgents, {
+    selectedAgentId: historyAgentId(selectedAgentId),
+  });
   if (n > 0) {
     menuBadge.textContent = n > 99 ? "99+" : String(n);
     menuBadge.classList.remove("hidden");
@@ -1341,19 +1345,20 @@ function renderActivityAgents() {
     const meta = document.createElement("div");
     meta.className = "activity-meta";
     const pid = agent.pid ? ` · pid ${agent.pid}` : "";
-    const turnHint = (() => {
-      try {
-        const n = loadHistory(agent.id).length;
-        if (!n) return " · empty chat";
-        return ` · ${n} msg${n === 1 ? "" : "s"} on phone`;
-      } catch {
-        return "";
-      }
-    })();
-    meta.textContent = `${agentStatusLine(agent)}${pid}${turnHint}`;
+    meta.textContent = `${agentStatusLine(agent)}${pid}`;
 
     const actions = document.createElement("div");
     actions.className = "activity-actions";
+
+    const renameBtn = document.createElement("button");
+    renameBtn.type = "button";
+    renameBtn.className = "activity-action";
+    renameBtn.textContent = "Rename";
+    renameBtn.onclick = (e) => {
+      e.stopPropagation();
+      void renameAgentFromMenu(agent);
+    };
+    actions.appendChild(renameBtn);
 
     const stopBtn = document.createElement("button");
     stopBtn.type = "button";
@@ -1449,6 +1454,10 @@ async function spawnAgentFromMenu() {
     showGate();
     return;
   }
+  const name = window.prompt("Name for the new agent (optional):", "");
+  // Cancel on prompt cancel — do not spawn
+  if (name === null) return;
+
   if (activitySpawn) activitySpawn.disabled = true;
   try {
     const res = await fetch("/api/agents", {
@@ -1457,7 +1466,9 @@ async function spawnAgentFromMenu() {
         Authorization: `Bearer ${secret}`,
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({}),
+      body: JSON.stringify({
+        label: String(name || "").trim() || undefined,
+      }),
     });
     const j = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(j.error || res.statusText);
@@ -1480,6 +1491,52 @@ async function spawnAgentFromMenu() {
     alert(`Could not start agent: ${e.message || e}`);
   } finally {
     if (activitySpawn) activitySpawn.disabled = false;
+  }
+}
+
+/**
+ * Rename main or an extra agent (Mac registry label).
+ * @param {{ id: string, label?: string, isMain?: boolean }} agent
+ */
+async function renameAgentFromMenu(agent) {
+  const secret = getSecret();
+  if (!secret || !agent?.id) return;
+  const current =
+    agent.label || (agent.isMain ? "Main" : agent.id.slice(0, 8));
+  const next = window.prompt("Rename agent:", current);
+  if (next === null) return; // cancelled
+  const label = String(next).trim();
+  if (!label) {
+    alert("Name can’t be empty.");
+    return;
+  }
+  if (label === current) return;
+  try {
+    const res = await fetch(
+      `/api/agents/${encodeURIComponent(agent.id)}/rename`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${secret}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ label }),
+      }
+    );
+    const j = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(j.error || res.statusText);
+    if (Array.isArray(j.agents)) knownAgents = j.agents;
+    else if (j.agent) {
+      knownAgents = knownAgents.map((a) =>
+        a.id === j.agent.id ? { ...a, ...j.agent } : a
+      );
+    }
+    updateAgentChip();
+    renderActivityAgents();
+    // Jobs list shows agentLabel from last poll — refresh for new names
+    void refreshActivity({ force: true });
+  } catch (e) {
+    alert(`Rename failed: ${e.message || e}`);
   }
 }
 

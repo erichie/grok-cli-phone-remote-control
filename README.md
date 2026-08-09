@@ -186,6 +186,28 @@ Note: **shell via `terminal/*` is still not chrooted.** Even with narrow fs root
 5. Keep the host machine locked / disk encrypted as usual
 6. Run `npm test` and `npm run check:leaks` before publishing changes
 
+### Publishing to the public repo (verify no local / private / secret data)
+
+This project is open source. **Before every commit and push to GitHub**, confirm nothing machine-specific or secret is included:
+
+| Do **not** commit | Examples |
+|-------------------|----------|
+| Secrets / tokens | Real `PHONE_CHAT_SECRET`, API keys, Bearer tokens, auth cookies |
+| Local paths | Absolute home dirs, external volume paths, machine-specific cwd strings |
+| Private network | Home LAN addresses, personal VPN hostnames if sensitive |
+| Personal identity | Personal email addresses, filled-in LaunchAgent plists, machine labels |
+| Runtime data | `~/.grok/phone-jobs`, inbox images, logs, `.env` with real values |
+
+**Required check (also runs in `npm test` via `test/no-local-leaks.test.mjs`):**
+
+```bash
+npm run check:leaks
+```
+
+That script fails if tracked sources match forbidden patterns (home/Volumes paths, assigned secrets, personal emails, etc.). Fix any hits before pushing.
+
+Also skim `git diff` / `git status` for untracked local files (`.env`, `*.plist` with real paths, screenshots). Prefer env vars and `*.example` templates only.
+
 ---
 
 ## Optional: start at login (macOS)
@@ -203,10 +225,12 @@ Copy it, replace every `REPLACE_*` value, install under `~/Library/LaunchAgents/
 ## Development
 
 ```bash
-npm start          # same as production entry (node server.mjs)
-npm test           # unit tests
-npm run check:leaks  # fail if tracked sources look machine-specific
+npm start            # same as production entry (node server.mjs)
+npm test             # unit tests (includes leak-pattern guard)
+npm run check:leaks  # required before push: no local paths / secrets in sources
 ```
+
+Always run `npm run check:leaks` (or full `npm test`) before pushing to the public remote — see **Publishing to the public repo** above.
 
 Layout:
 
