@@ -1,12 +1,16 @@
 # Grok CLI Phone Remote Control
 
-Installable **phone remote-control PWA** for your **local [Grok CLI](https://x.ai) / Grok Build agent** (full tools, your workspace). Supports photos, **voice dictation** (speech→text in the composer), slash commands, durable job queue (phone can lock), multi-agent sessions, usage lookup, session reconnect, and inline Imagine images.
+Installable **phone remote-control PWA** for your **local [Grok CLI](https://x.ai) / Grok Build agent** (full tools, your workspace). Supports photos, **voice dictation** (live speech→text), slash commands, durable job queue (phone can lock), multi-agent sessions, usage lookup, session reconnect, and inline Imagine images.
 
-**Voice dictation (no paid Tailscale Serve):**
+**Voice dictation at a glance (no paid Tailscale Serve):**
 
-1. **Browser speech-to-text (preferred on HTTPS)** — tap mic → speak → words appear **live** in the box (Web Speech API). Use free self-signed HTTPS (`https://<mac-ip>:8788`) so iPhone allows the mic. No Mac transcription.
-2. **Keyboard STT** — if the browser has no Speech API, use the iPhone keyboard 🎤 (also real Apple STT, works on `http://`).
-3. **Fallback:** record audio and STT on the Mac only when browser STT is unavailable.
+| Path | Needs | What you get |
+|------|--------|----------------|
+| **Live mic (Web Speech)** | Free self-signed **HTTPS** (default port **8788**) | Tap mic → words appear live; say **bee boop** (or your phrase) to send |
+| **Keyboard STT** | Plain `http://` is fine | iPhone keyboard 🎤 — real Apple STT |
+| **Voice memo file** | Plain `http://` is fine | Record/pick audio → Mac transcribes |
+
+Setup detail: **[Live mic: free local HTTPS](#live-mic-free-local-https)** below. Agent-oriented setup: [`.grok/skills/phone-remote-control/SKILL.md`](./.grok/skills/phone-remote-control/SKILL.md).
 
 This is **not** a mirror of an open TUI session. It starts its own ACP process:
 
@@ -56,10 +60,13 @@ npm start
 You should see something like:
 
 ```text
-grok-cli-phone-remote-control listening on http://0.0.0.0:8787
+grok-cli-phone-remote-control
+  http:   http://0.0.0.0:8787
+  https:  https://0.0.0.0:8788  (free self-signed — live iPhone mic)
+  open:   https://<this-mac-ip>:8788
 ```
 
-Leave this process running (and keep the machine awake while you chat).
+Leave this process running (and keep the machine awake while you chat). **Chat works on HTTP; live in-page mic needs the HTTPS URL** (next section).
 
 ### First-run macOS permissions (important)
 
@@ -82,10 +89,47 @@ You may need to restart `npm start` / the LaunchAgent after changing permissions
    - **[Tailscale](https://tailscale.com) on both** (recommended when you’re not on the same LAN — devices talk over a private mesh).
 2. Find the host’s IP:
    - LAN: System Settings → Network, or `ipconfig getifaddr en0` on macOS  
-   - Tailscale: Machine IP in the Tailscale app / admin console
-3. In Safari/Chrome open: `http://<host-ip>:8787` (use the **Tailscale IP** when using Tailscale).
+   - Tailscale: Machine IP in the Tailscale app / admin console (often `100.x.y.z`)
+3. In Safari open:
+   - **Chat only / keyboard dictate:** `http://<host-ip>:8787`
+   - **Live mic (preferred):** `https://<host-ip>:8788` — see [Live mic: free local HTTPS](#live-mic-free-local-https)
 4. Enter the same `PHONE_CHAT_SECRET`.
-5. **Safari → Share → Add to Home Screen** for an installable PWA.
+5. **Safari → Share → Add to Home Screen** for the URL you actually use (HTTP and HTTPS are different homescreen icons).
+
+---
+
+## Live mic: free local HTTPS
+
+iOS only allows the **in-page microphone** (Web Speech / MediaRecorder) in a **secure context**. This bridge dual-listens:
+
+| Scheme | Default port | Purpose |
+|--------|--------------|---------|
+| `http://` | `8787` (`PHONE_CHAT_PORT`) | Chat, jobs, keyboard STT, voice-memo upload |
+| `https://` | `8788` (`PHONE_CHAT_HTTPS_PORT`, default **HTTP+1**) | Live mic + same API |
+
+No paid **Tailscale Serve** plan is required. The Mac generates a **self-signed cert** (OpenSSL) under `~/.grok/phone-pwa-tls/` with SANs for localhost, LAN IPs, Tailscale `100.x` IPs, and MagicDNS names when `tailscale status` is available.
+
+### One-time trust on iPhone (Safari)
+
+1. Start the bridge (`npm start`) and note the **`open: https://…:8788`** line in the banner.
+2. On the phone open **exactly that host and port** (Tailscale IP or MagicDNS name if you use Tailscale).
+3. Safari will warn that the certificate is not trusted → **Show Details → visit this website** (or Advanced → proceed).
+4. Optional but durable: **Settings → General → About → Certificate Trust Settings** and enable full trust for the cert if iOS offers it.
+5. Unlock with `PHONE_CHAT_SECRET`, then **Share → Add to Home Screen** from the **HTTPS** tab so the PWA stays on a secure origin.
+6. Tap the mic. Words should stream live. Default spoken send phrase: **bee boop** (change under **Menu → Voice send**).
+
+### Tips and pitfalls
+
+- **Wrong port is the #1 failure.** Live mic is **`:8788`**, not `:8787`.
+- After changing network (new LAN IP / Tailscale), restart the bridge so the cert SAN list regenerates, then reopen the new `https://…` URL.
+- Extra hostnames: `PHONE_CHAT_TLS_HOSTS=mac.tailnet.ts.net,other.name`
+- Disable TLS entirely: `PHONE_CHAT_TLS=0` (live mic will not work; keyboard / voice memo still do on HTTP).
+- From the in-app dictation sheet, **Live mic (free HTTPS)** jumps to the status-reported HTTPS URL when available.
+- **Do not** expose `8787` / `8788` on the public internet. LAN or Tailscale only.
+
+### Spoken send phrase
+
+While dictating, say your send phrase **at the end** of the utterance to auto-send (trigger is stripped). Defaults: `bee boop`, `beep boop`, `b boop`. Edit anytime: **Menu → Voice send** (saved on that phone only via `localStorage`).
 
 ---
 
@@ -94,17 +138,21 @@ You may need to restart `npm start` / the LaunchAgent after changing permissions
 So the phone and Mac can talk from anywhere without opening your home router:
 
 1. Install [Tailscale](https://tailscale.com) on the **Mac** and the **phone**, sign in to the same account/tailnet.
-2. On the Mac, note its **Tailscale IP** (e.g. `100.x.y.z`).
+2. On the Mac, note its **Tailscale IP** (e.g. `100.x.y.z`) or MagicDNS name.
 3. Keep `npm start` (or the LaunchAgent) running on the Mac.
 4. On the phone open:
 
 ```text
+# Chat / keyboard STT
 http://<mac-tailscale-ip>:8787
+
+# Live mic (trust self-signed cert once)
+https://<mac-tailscale-ip>:8788
 ```
 
-5. Enter `PHONE_CHAT_SECRET` once and add to Home Screen if you like.
+5. Enter `PHONE_CHAT_SECRET` once and add to Home Screen from the URL you want day-to-day (prefer HTTPS if you use the mic).
 
-**Do not** expose port `8787` to the public internet. This app is a personal LAN / Tailscale bridge, not a multi-tenant service.
+**Do not** expose ports `8787` / `8788` to the public internet. This app is a personal LAN / Tailscale bridge, not a multi-tenant service.
 
 ---
 
@@ -114,6 +162,9 @@ http://<mac-tailscale-ip>:8787
 |----------|---------|---------|
 | `PHONE_CHAT_SECRET` | **required** | Bearer token for all `/api/*` routes |
 | `PHONE_CHAT_PORT` | `8787` | HTTP port |
+| `PHONE_CHAT_HTTPS_PORT` | HTTP port + 1 (`8788`) | Free self-signed HTTPS for live mic |
+| `PHONE_CHAT_TLS` | on | Set `0` / `false` to disable HTTPS listen |
+| `PHONE_CHAT_TLS_HOSTS` | unset | Extra DNS names for cert SAN (comma/space separated) |
 | `PHONE_CHAT_HOST` | `0.0.0.0` | Bind address (`127.0.0.1` for localhost only) |
 | `PHONE_CHAT_CWD` | parent of this app directory | Working directory for the agent |
 | `GROK_BIN` | `grok` | Path to the Grok CLI binary |
@@ -131,6 +182,8 @@ http://<mac-tailscale-ip>:8787
 
 - Chat with the local agent (tools, skills, MCP as configured for Grok on that machine)
 - Photo attach (library / camera) → saved under `~/.grok/phone-inbox/`
+- **Voice dictation:** live Web Speech on free HTTPS, keyboard STT on HTTP, Mac STT fallback; configurable spoken send phrase
+- **Multi-agent:** Menu → spawn concurrent Grok processes; header **To** chip switches chat; Stop kills that process on the Mac
 - Durable jobs under `~/.grok/phone-jobs/` (phone may lock; work continues on the host)
 - **Live reply push** via Server-Sent Events (`GET /api/jobs/:id/stream`) so finished answers hit the phone immediately (polling is only a backup). WebRTC is unnecessary for this; SSE is the simple phone↔host push channel.
 - **Reset** button: cancel queue + restart agent session
@@ -241,9 +294,10 @@ Always run `npm run check:leaks` (or full `npm test`) before pushing to the publ
 Layout:
 
 ```text
-server.mjs          # HTTP + ACP bridge + job queue
+server.mjs          # HTTP + free HTTPS + ACP bridge + job queue
 public/             # PWA (HTML/CSS/JS, service worker, icons)
-lib/                # shared ACP demux, job stream, fs, terminal helpers
+lib/                # ACP, jobs, dictation, free TLS helpers
+.grok/skills/       # project skills (phone setup / best use)
 examples/           # templates with placeholders only
 test/               # node:test suite
 scripts/            # repo hygiene helpers
