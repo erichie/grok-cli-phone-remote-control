@@ -1,6 +1,8 @@
 # Grok CLI Phone Remote Control
 
-Installable **phone remote-control PWA** for your **local [Grok CLI](https://x.ai) / Grok Build agent** (full tools, your workspace). Supports photos, slash commands, durable job queue (phone can lock), usage lookup, session reconnect, and inline Imagine images.
+Installable **phone remote-control PWA** for your **local [Grok CLI](https://x.ai) / Grok Build agent** (full tools, your workspace). Supports photos, **voice dictation** (speech→text in the composer), slash commands, durable job queue (phone can lock), multi-agent sessions, usage lookup, session reconnect, and inline Imagine images.
+
+**Voice dictation (no paid HTTPS required):** works over plain **http://** on your LAN. On iPhone, the mic opens the system **voice memo / audio** picker (live browser mic APIs need HTTPS, so we don’t require that). The Mac transcribes via `scripts/macos-transcribe.swift` (Speech framework), or whisper / `PHONE_CHAT_STT_CMD`. Needs **ffmpeg** on the Mac for audio convert, and **Speech Recognition** permission for Terminal/`swift` the first time.
 
 This is **not** a mirror of an open TUI session. It starts its own ACP process:
 

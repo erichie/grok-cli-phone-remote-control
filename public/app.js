@@ -18,6 +18,25 @@ import {
   activityBadgeCount,
   chatAgentIdPayload,
 } from "./activity-ui.mjs";
+import {
+  getSpeechRecognitionCtor,
+  isSpeechRecognitionSupported,
+  isMediaRecorderDictationSupported,
+  isAnyDictationSupported,
+  isSecureDictationContext,
+  isAppleMobileSpeech,
+  preferServerDictation,
+  preferContinuousRecognition,
+  pickAudioRecorderMime,
+  mergeDictationText,
+  consumeRecognitionResults,
+  speechRecognitionErrorMessage,
+  dictationBlockedReason,
+  hasGetUserMedia,
+  isNativeAudioFileDictationSupported,
+  selectDictationPath,
+  buildComposerDraft,
+} from "./voice-ui.mjs";
 
 const $ = (id) => document.getElementById(id);
 
@@ -45,16 +64,18 @@ const secretInput = $("secret");
 const unlockBtn = $("unlock");
 const input = $("input");
 const sendBtn = $("send");
-const attachBtn = $("attach");
-const fileLibrary = $("file-library");
-const fileCamera = $("file-camera");
+const actionsBtn = $("actions-btn");
+const micBtn = $("mic");
+const dictationHint = $("dictation-hint");
+const filePhotos = $("file-photos");
+const fileAudio = $("file-audio");
 const previews = $("previews");
 const slashMenu = $("slash-menu");
-const attachSheet = $("attach-sheet");
-const attachBackdrop = $("attach-backdrop");
-const pickLibrary = $("pick-library");
-const pickCamera = $("pick-camera");
-const attachCancel = $("attach-cancel");
+const actionsSheet = $("actions-sheet");
+const actionsBackdrop = $("actions-backdrop");
+const actionPhoto = $("action-photo");
+const actionTools = $("action-tools");
+const actionsCancel = $("actions-cancel");
 
 /** Base key — actual storage is per-agent: `${HISTORY_KEY}:${agentId}`. */
 const HISTORY_KEY = "phone_chat_history_v1";
@@ -1872,28 +1893,651 @@ if (secretInput) {
   });
 }
 
+// ── Voice dictation (speech → text) ─────────────────────────────────────────
+// iOS home-screen PWAs do NOT expose webkitSpeechRecognition. Primary path:
+// MediaRecorder → POST /api/dictation → Mac Speech / whisper. Fallback: Web Speech.
+
+/** @type {SpeechRecognition | null} */
+let speechRec = null;
+/** @type {MediaRecorder | null} */
+let mediaRecorder = null;
+/** @type {MediaStream | null} */
+let mediaStream = null;
+/** @type {Blob[]} */
+let mediaChunks = [];
+/** "browser" | "server" | null */
+let dictationMode = null;
+let dictationActive = false;
+let dictationBase = "";
+/** @type {string[]} */
+let dictationFinals = [];
+let dictationResultIndex = 0;
+let dictationWantListening = false;
+/** @type {ReturnType<typeof setTimeout> | null} */
+let dictationRestartTimer = null;
+let dictationUploading = false;
+
+function setDictationHint(text, live = false) {
+  if (!dictationHint) return;
+  if (!text) {
+    dictationHint.textContent = "";
+    dictationHint.classList.add("hidden");
+    dictationHint.classList.remove("live");
+    return;
+  }
+  dictationHint.textContent = text;
+  dictationHint.classList.remove("hidden");
+  dictationHint.classList.toggle("live", !!live);
+}
+
+function resizeComposerInput() {
+  if (!input) return;
+  input.style.height = "auto";
+  input.style.height = Math.min(140, input.scrollHeight) + "px";
+}
+
+function applyDictationToInput(interim = "") {
+  if (!input) return;
+  input.value = mergeDictationText(dictationBase, dictationFinals, interim);
+  resizeComposerInput();
+  try {
+    const n = input.value.length;
+    input.setSelectionRange(n, n);
+  } catch {
+    /* ignore */
+  }
+}
+
+/**
+ * Put transcribed words into the composer as a draft — never auto-sends.
+ * Highlights the new text so you can review/edit before tapping ↑.
+ * @param {string} text
+ */
+function appendTranscriptToInput(text) {
+  if (!input) return;
+  const t = String(text || "").trim();
+  if (!t) return;
+  const before = input.value || "";
+  const next = buildComposerDraft(before, t);
+  const trimmedBefore = String(before).replace(/\s+$/u, "");
+  const start = trimmedBefore.length ? trimmedBefore.length + 1 : 0;
+  input.value = next;
+  resizeComposerInput();
+  // Mark as draft ready (visible ring) so it's obvious this is pre-send
+  input.classList.add("dictation-draft");
+  try {
+    input.focus({ preventScroll: true });
+  } catch {
+    try {
+      input.focus();
+    } catch {
+      /* ignore */
+    }
+  }
+  try {
+    // Select just the new words so you can read / retype / keep them
+    input.setSelectionRange(start, input.value.length);
+  } catch {
+    /* ignore */
+  }
+  // Soften highlight after a moment so you can keep typing
+  setTimeout(() => {
+    try {
+      const end = input.value.length;
+      input.setSelectionRange(end, end);
+    } catch {
+      /* ignore */
+    }
+  }, 2200);
+}
+
+function clearDictationDraftUi() {
+  input?.classList.remove("dictation-draft");
+}
+
+function setMicUi(listening) {
+  dictationActive = !!listening;
+  if (!micBtn) return;
+  micBtn.classList.toggle("mic-listening", dictationActive);
+  micBtn.setAttribute("aria-pressed", dictationActive ? "true" : "false");
+  micBtn.setAttribute(
+    "aria-label",
+    dictationActive ? "Stop dictation" : "Dictate"
+  );
+  micBtn.title = dictationActive
+    ? "Listening… tap to stop"
+    : "Dictate with your voice";
+}
+
+function clearDictationRestart() {
+  if (dictationRestartTimer) {
+    clearTimeout(dictationRestartTimer);
+    dictationRestartTimer = null;
+  }
+}
+
+function detachSpeechRec() {
+  if (!speechRec) return;
+  try {
+    speechRec.onstart = null;
+    speechRec.onresult = null;
+    speechRec.onerror = null;
+    speechRec.onend = null;
+  } catch {
+    /* ignore */
+  }
+  speechRec = null;
+}
+
+function stopMediaTracks() {
+  if (mediaStream) {
+    for (const t of mediaStream.getTracks()) {
+      try {
+        t.stop();
+      } catch {
+        /* ignore */
+      }
+    }
+    mediaStream = null;
+  }
+}
+
+function stopDictation({ keepHint = false } = {}) {
+  dictationWantListening = false;
+  clearDictationRestart();
+
+  if (mediaRecorder && (dictationMode === "server" || mediaRecorder.state !== "inactive")) {
+    const rec = mediaRecorder;
+    // onstop handler uploads + clears tracks
+    if (rec.state === "recording" || rec.state === "paused") {
+      try {
+        rec.stop();
+      } catch {
+        stopMediaTracks();
+        mediaRecorder = null;
+        dictationMode = null;
+        setMicUi(false);
+      }
+    } else {
+      stopMediaTracks();
+      mediaRecorder = null;
+      dictationMode = null;
+      setMicUi(false);
+    }
+  } else {
+    const rec = speechRec;
+    detachSpeechRec();
+    try {
+      rec?.stop?.();
+    } catch {
+      /* ignore */
+    }
+    dictationMode = null;
+    setMicUi(false);
+  }
+
+  if (!keepHint && !dictationUploading) setDictationHint("");
+}
+
+function promoteDictationBaseFromInput() {
+  dictationBase = (input?.value || "").replace(/\s+$/u, "");
+  dictationFinals = [];
+  dictationResultIndex = 0;
+}
+
+// ── Server path (MediaRecorder → Mac) — works in iOS PWA ───────────────────
+
+async function uploadDictationBlob(blob) {
+  const secret = getSecret();
+  if (!secret) {
+    showGate();
+    return;
+  }
+  if (!blob || !blob.size) {
+    setDictationHint("No audio captured. Tap mic and try again.");
+    return;
+  }
+  dictationUploading = true;
+  setDictationHint("Transcribing on Mac…", true);
+  try {
+    const locale =
+      (typeof navigator !== "undefined" && navigator.language) || "en-US";
+    const res = await fetch(
+      `/api/dictation?locale=${encodeURIComponent(locale)}`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${secret}`,
+          "Content-Type": blob.type || "application/octet-stream",
+        },
+        body: blob,
+      }
+    );
+    const j = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      throw new Error(j.error || res.statusText || String(res.status));
+    }
+    const text = String(j.text || "").trim();
+    if (!text) {
+      setDictationHint("Heard nothing — try again a bit louder.");
+      return;
+    }
+    // Always land in the composer as a draft — you send manually with ↑
+    appendTranscriptToInput(text);
+    setDictationHint(
+      "Draft in the box — review/edit, then tap ↑ to send. Mic again to add more."
+    );
+  } catch (e) {
+    setDictationHint(
+      e?.message
+        ? `Dictation failed: ${e.message}`
+        : "Dictation failed. Is the Mac bridge running?"
+    );
+  } finally {
+    dictationUploading = false;
+  }
+}
+
+async function requestMicStream() {
+  const constraints = {
+    audio: {
+      echoCancellation: true,
+      noiseSuppression: true,
+      channelCount: 1,
+    },
+    video: false,
+  };
+  const md = navigator.mediaDevices;
+  if (md?.getUserMedia) {
+    return md.getUserMedia(constraints);
+  }
+  // Very old prefixes (unlikely on modern iOS)
+  const legacy =
+    navigator.getUserMedia ||
+    navigator.webkitGetUserMedia ||
+    navigator.mozGetUserMedia;
+  if (typeof legacy === "function") {
+    return new Promise((resolve, reject) => {
+      legacy.call(navigator, constraints, resolve, reject);
+    });
+  }
+  const err = new Error(
+    "getUserMedia missing — open this app over HTTPS (not plain http://)."
+  );
+  err.name = "NotSupportedError";
+  throw err;
+}
+
+async function startServerDictation() {
+  if (!isSecureDictationContext()) {
+    setDictationHint(speechRecognitionErrorMessage("insecure-context"));
+    return;
+  }
+  hideSlashMenu();
+  setMicUi(true);
+  // This string means getUserMedia is about to run — iOS should prompt now.
+  setDictationHint("Requesting microphone…", true);
+
+  try {
+    // First await = permission prompt (must stay close to the tap gesture).
+    mediaStream = await requestMicStream();
+  } catch (e) {
+    setMicUi(false);
+    const name = e?.name || "";
+    if (name === "NotAllowedError" || name === "PermissionDeniedError") {
+      setDictationHint(speechRecognitionErrorMessage("not-allowed"));
+    } else if (name === "NotFoundError") {
+      setDictationHint(speechRecognitionErrorMessage("audio-capture"));
+    } else if (
+      name === "NotSupportedError" ||
+      name === "TypeError" ||
+      /getUserMedia|mediaDevices/i.test(String(e?.message || ""))
+    ) {
+      setDictationHint(speechRecognitionErrorMessage("insecure-context"));
+    } else {
+      setDictationHint(
+        e?.message
+          ? `Mic error: ${e.message}`
+          : "Could not open microphone."
+      );
+    }
+    return;
+  }
+
+  mediaChunks = [];
+  const mime = pickAudioRecorderMime();
+  let rec;
+  try {
+    rec = mime
+      ? new MediaRecorder(mediaStream, { mimeType: mime })
+      : new MediaRecorder(mediaStream);
+  } catch {
+    try {
+      rec = new MediaRecorder(mediaStream);
+    } catch (e2) {
+      stopMediaTracks();
+      setMicUi(false);
+      setDictationHint(
+        e2?.message
+          ? `Recorder error: ${e2.message}`
+          : "MediaRecorder not available."
+      );
+      return;
+    }
+  }
+
+  mediaRecorder = rec;
+  dictationMode = "server";
+  dictationWantListening = true;
+
+  rec.ondataavailable = (ev) => {
+    if (ev.data && ev.data.size > 0) mediaChunks.push(ev.data);
+  };
+
+  rec.onerror = () => {
+    setDictationHint("Recording error. Try again.");
+  };
+
+  rec.onstop = () => {
+    const type = rec.mimeType || mime || "audio/webm";
+    const blob = new Blob(mediaChunks, { type });
+    mediaChunks = [];
+    mediaRecorder = null;
+    stopMediaTracks();
+    setMicUi(false);
+    dictationMode = null;
+    dictationWantListening = false;
+    void uploadDictationBlob(blob);
+  };
+
+  try {
+    // timeslice helps some iOS builds flush data
+    rec.start(1000);
+    setDictationHint(
+      "Recording… tap the mic when finished — your words will appear here to review before send.",
+      true
+    );
+  } catch (e) {
+    stopMediaTracks();
+    mediaRecorder = null;
+    dictationMode = null;
+    dictationWantListening = false;
+    setMicUi(false);
+    setDictationHint(
+      e?.message ? `Could not record: ${e.message}` : "Could not start recorder."
+    );
+  }
+}
+
+// ── Browser Web Speech path (Chrome / some Safari tabs — not iOS PWA) ───────
+
+function createSpeechRecognition() {
+  const Ctor = getSpeechRecognitionCtor();
+  if (!Ctor) return null;
+  const rec = new Ctor();
+  rec.continuous = preferContinuousRecognition();
+  rec.interimResults = true;
+  try {
+    rec.maxAlternatives = 1;
+  } catch {
+    /* ignore */
+  }
+  rec.lang =
+    (typeof navigator !== "undefined" && navigator.language) || "en-US";
+
+  rec.onstart = () => {
+    setMicUi(true);
+    setDictationHint("Listening… tap mic when done.", true);
+  };
+
+  rec.onresult = (ev) => {
+    const { finals, interim, nextIndex } = consumeRecognitionResults(
+      ev,
+      dictationResultIndex
+    );
+    dictationResultIndex = nextIndex;
+    if (finals.length) dictationFinals.push(...finals);
+    applyDictationToInput(interim);
+  };
+
+  rec.onerror = (ev) => {
+    const code = ev?.error || "";
+    if (code === "aborted" || (code === "no-speech" && dictationWantListening)) {
+      return;
+    }
+    const msg = speechRecognitionErrorMessage(code);
+    if (msg) setDictationHint(msg, false);
+    if (
+      code === "not-allowed" ||
+      code === "service-not-allowed" ||
+      code === "audio-capture"
+    ) {
+      dictationWantListening = false;
+      clearDictationRestart();
+      setMicUi(false);
+    }
+  };
+
+  rec.onend = () => {
+    promoteDictationBaseFromInput();
+    if (!dictationWantListening) {
+      setMicUi(false);
+      return;
+    }
+    clearDictationRestart();
+    const delay = isAppleMobileSpeech() ? 280 : 120;
+    dictationRestartTimer = setTimeout(() => {
+      dictationRestartTimer = null;
+      if (!dictationWantListening) return;
+      beginBrowserRecognitionSession();
+    }, delay);
+  };
+
+  return rec;
+}
+
+function beginBrowserRecognitionSession() {
+  if (!dictationWantListening) return;
+  detachSpeechRec();
+  const rec = createSpeechRecognition();
+  if (!rec) {
+    dictationWantListening = false;
+    setMicUi(false);
+    setDictationHint("Browser speech unavailable — try again.");
+    return;
+  }
+  speechRec = rec;
+  dictationMode = "browser";
+  try {
+    speechRec.start();
+    setMicUi(true);
+  } catch (e) {
+    if (e?.name === "InvalidStateError" && dictationWantListening) {
+      setMicUi(true);
+      return;
+    }
+    dictationWantListening = false;
+    setMicUi(false);
+    detachSpeechRec();
+    setDictationHint(
+      e?.message
+        ? `Could not start mic: ${e.message}`
+        : "Could not start speech recognition."
+    );
+  }
+}
+
+async function startBrowserDictation() {
+  if (!isSecureDictationContext()) {
+    setDictationHint(speechRecognitionErrorMessage("insecure-context"));
+    return;
+  }
+  hideSlashMenu();
+  promoteDictationBaseFromInput();
+  dictationWantListening = true;
+  dictationMode = "browser";
+  setMicUi(true);
+  setDictationHint("Starting…", true);
+  beginBrowserRecognitionSession();
+}
+
+/**
+ * Plain http:// path: system voice-memo / audio file picker (no getUserMedia).
+ * Works on iOS Home Screen without HTTPS or Tailscale.
+ */
+function startNativeAudioFileDictation() {
+  if (!fileAudio) {
+    setDictationHint("Audio picker missing — hard-refresh the app.");
+    return;
+  }
+  hideSlashMenu();
+  setDictationHint(
+    "Record a voice memo (or pick audio), then Open — text appears here to review before send.",
+    true
+  );
+  // Must stay synchronous with the tap for iOS
+  fileAudio.click();
+}
+
+if (fileAudio) {
+  fileAudio.onchange = async () => {
+    const file = fileAudio.files && fileAudio.files[0];
+    fileAudio.value = "";
+    if (!file) {
+      setDictationHint("");
+      return;
+    }
+    setDictationHint("Transcribing on Mac…", true);
+    try {
+      await uploadDictationBlob(file);
+    } catch (e) {
+      setDictationHint(
+        e?.message ? `Dictation failed: ${e.message}` : "Dictation failed."
+      );
+    }
+  };
+}
+
+/**
+ * Prefer MediaRecorder when HTTPS allows it; otherwise native voice-memo file
+ * picker (works on plain http:// LAN — free, no Tailscale).
+ */
+async function startDictation() {
+  if (dictationUploading) {
+    setDictationHint("Still transcribing…");
+    return;
+  }
+
+  // Toggle off (browser live or recording)
+  if (dictationActive || dictationWantListening || mediaRecorder) {
+    const wasServer = dictationMode === "server" || !!mediaRecorder;
+    stopDictation({ keepHint: wasServer });
+    if (wasServer) setDictationHint("Stopping…", true);
+    return;
+  }
+
+  // Shared path selection (unit-tested in voice-ui.mjs)
+  const path = selectDictationPath();
+  if (path === "server-media") {
+    await startServerDictation();
+    return;
+  }
+  if (path === "browser-speech") {
+    await startBrowserDictation();
+    return;
+  }
+  if (path === "native-audio-file" && fileAudio) {
+    // Plain http:// LAN — free, no paid TLS
+    startNativeAudioFileDictation();
+    return;
+  }
+
+  setDictationHint(
+    dictationBlockedReason() || "Voice dictation isn’t available here."
+  );
+}
+
+function initMicButton() {
+  if (!micBtn) return;
+  // Always tappable — we have voice-memo fallback on http://
+  micBtn.classList.remove("mic-unsupported");
+  micBtn.title = "Dictate with your voice";
+  micBtn.addEventListener("click", (e) => {
+    e.preventDefault();
+    void startDictation();
+  });
+}
+initMicButton();
+
 // ── Attach: library + camera ───────────────────────────────────────────────
 
-function openAttachSheet() {
-  attachSheet.classList.remove("hidden");
-  attachSheet.setAttribute("aria-hidden", "false");
-}
-function closeAttachSheet() {
-  attachSheet.classList.add("hidden");
-  attachSheet.setAttribute("aria-hidden", "true");
+// ── Composer actions (＋): photo + tools ────────────────────────────────────
+
+function openActionsSheet() {
+  if (!actionsSheet) return;
+  actionsSheet.classList.remove("hidden");
+  actionsSheet.setAttribute("aria-hidden", "false");
+  if (actionsBtn) actionsBtn.setAttribute("aria-expanded", "true");
 }
 
-attachBtn.onclick = () => openAttachSheet();
-attachBackdrop.onclick = () => closeAttachSheet();
-attachCancel.onclick = () => closeAttachSheet();
-pickLibrary.onclick = () => {
-  closeAttachSheet();
-  fileLibrary.click();
-};
-pickCamera.onclick = () => {
-  closeAttachSheet();
-  fileCamera.click();
-};
+function closeActionsSheet() {
+  if (!actionsSheet) return;
+  actionsSheet.classList.add("hidden");
+  actionsSheet.setAttribute("aria-hidden", "true");
+  if (actionsBtn) actionsBtn.setAttribute("aria-expanded", "false");
+}
+
+/** Open the slash-tools panel (same list as typing `/`). */
+async function openToolsMenu() {
+  closeActionsSheet();
+  if (!toolsCatalog.length) {
+    await loadTools();
+  }
+  slashActiveIndex = 0;
+  // Empty composer: seed `/` so typing filters the list like a slash command
+  if (input && !String(input.value || "").trim() && !slashQueryFromInput()) {
+    input.value = "/";
+    try {
+      input.setSelectionRange(1, 1);
+    } catch {
+      /* ignore */
+    }
+  }
+  showSlashMenu(filteredTools(slashQueryFromInput()?.query || ""));
+  try {
+    input?.focus({ preventScroll: true });
+  } catch {
+    try {
+      input?.focus();
+    } catch {
+      /* ignore */
+    }
+  }
+  if (typeof resizeComposerInput === "function") resizeComposerInput();
+}
+
+if (actionsBtn) {
+  actionsBtn.onclick = () => {
+    if (actionsSheet && !actionsSheet.classList.contains("hidden")) {
+      closeActionsSheet();
+    } else {
+      openActionsSheet();
+    }
+  };
+}
+if (actionsBackdrop) actionsBackdrop.onclick = () => closeActionsSheet();
+if (actionsCancel) actionsCancel.onclick = () => closeActionsSheet();
+if (actionPhoto) {
+  actionPhoto.onclick = () => {
+    closeActionsSheet();
+    filePhotos?.click();
+  };
+}
+if (actionTools) {
+  actionTools.onclick = () => {
+    void openToolsMenu();
+  };
+}
 
 async function onFilesSelected(fileList) {
   const files = [...(fileList || [])];
@@ -1904,14 +2548,12 @@ async function onFilesSelected(fileList) {
   renderPreviews();
 }
 
-fileLibrary.onchange = async () => {
-  await onFilesSelected(fileLibrary.files);
-  fileLibrary.value = "";
-};
-fileCamera.onchange = async () => {
-  await onFilesSelected(fileCamera.files);
-  fileCamera.value = "";
-};
+if (filePhotos) {
+  filePhotos.onchange = async () => {
+    await onFilesSelected(filePhotos.files);
+    filePhotos.value = "";
+  };
+}
 
 // ── Slash tool menu ────────────────────────────────────────────────────────
 
@@ -2024,6 +2666,8 @@ function updateSlashMenu() {
 input.addEventListener("input", () => {
   input.style.height = "auto";
   input.style.height = Math.min(140, input.scrollHeight) + "px";
+  // User is editing the draft — drop the highlight ring
+  clearDictationDraftUi();
   updateSlashMenu();
 });
 
@@ -2068,14 +2712,21 @@ async function send() {
     return;
   }
 
+  // Stop mic so we don't keep appending after send
+  if (dictationActive || dictationWantListening || mediaRecorder) {
+    stopDictation();
+  }
+
   const imgs = pendingImages.slice();
   const imageDataUrls = imgs.map(dataUrlFromImage);
   addMsg("user", text || "(photo)", { images: imageDataUrls });
   input.value = "";
   input.style.height = "auto";
+  clearDictationDraftUi();
   pendingImages = [];
   renderPreviews();
   hideSlashMenu();
+  setDictationHint("");
 
   const { body, thinkingEl } = addMsg("bot", "", {
     showThinking: true,

@@ -20,7 +20,15 @@ import {
   writeFileSync,
   statSync,
 } from "node:fs";
-import { readFile, writeFile, mkdir, readdir, stat, rename } from "node:fs/promises";
+import {
+  readFile,
+  writeFile,
+  mkdir,
+  readdir,
+  stat,
+  rename,
+  unlink,
+} from "node:fs/promises";
 import { join, extname, dirname, resolve, basename } from "node:path";
 import { fileURLToPath } from "node:url";
 import { homedir, tmpdir } from "node:os";
@@ -55,6 +63,10 @@ import {
   createAgentRegistry,
   killProcessTree,
 } from "./lib/agent-registry.mjs";
+import {
+  processDictationAudio,
+  normalizeDictationSuccess,
+} from "./lib/dictation.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PUBLIC = join(__dirname, "public");
@@ -2800,6 +2812,61 @@ async function handleTools(req, res) {
   });
 }
 
+// ─── Phone dictation: MediaRecorder / voice-memo → Mac transcription ────────
+// iOS PWAs lack webkitSpeechRecognition; http:// uses native audio file picker.
+// Shared pipeline lives in lib/dictation.mjs (unit-tested).
+
+const DICTATION_DIR = join(homedir(), ".grok", "phone-dictation");
+const DICTATION_MAX_BYTES = Number(
+  process.env.PHONE_CHAT_DICTATION_MAX_BYTES || 8 * 1024 * 1024
+);
+
+/**
+ * POST /api/dictation
+ * Body: raw audio bytes (webm/mp4/m4a/wav/caf) — Content-Type indicates format.
+ * Query/header: locale optional.
+ */
+async function handleDictation(req, res) {
+  if (!authOk(req)) return sendJson(res, 401, { error: "unauthorized" });
+  let buf;
+  try {
+    buf = await readBody(req, DICTATION_MAX_BYTES);
+  } catch (e) {
+    if (e && e.code === "BODY_TOO_LARGE") {
+      return sendJson(res, 413, { error: e.message });
+    }
+    return sendJson(res, 400, { error: "failed to read body" });
+  }
+  if (!buf || !buf.length) {
+    return sendJson(res, 400, { error: "empty audio", code: "EMPTY_AUDIO" });
+  }
+
+  const ctype = String(req.headers["content-type"] || "");
+  const url = new URL(req.url || "/", `http://${req.headers.host}`);
+  const locale =
+    url.searchParams.get("locale") ||
+    req.headers["x-speech-locale"] ||
+    "en-US";
+
+  try {
+    const result = await processDictationAudio(buf, {
+      contentType: ctype,
+      locale: String(locale),
+      workDir: DICTATION_DIR,
+      cwd: CWD,
+    });
+    const payload = normalizeDictationSuccess(result);
+    sendJson(res, 200, payload);
+  } catch (e) {
+    console.error("[dictation]", e.message || e);
+    const code = e?.code === "EMPTY_AUDIO" || e?.code === "EMPTY_TRANSCRIPT" ? 400 : 500;
+    sendJson(res, code, {
+      error: e instanceof Error ? e.message : String(e),
+      code: e?.code || "DICTATION_FAILED",
+    });
+  }
+}
+
 function serveStatic(req, res) {
   let path = (req.url || "/").split("?")[0];
   if (path === "/") path = "/index.html";
@@ -2829,6 +2896,9 @@ const server = http.createServer(async (req, res) => {
   try {
     if (req.method === "POST" && pathOnly === "/api/chat") {
       return await handleChat(req, res);
+    }
+    if (req.method === "POST" && pathOnly === "/api/dictation") {
+      return await handleDictation(req, res);
     }
     if (req.method === "POST" && pathOnly === "/api/reset") {
       return await handleReset(req, res);

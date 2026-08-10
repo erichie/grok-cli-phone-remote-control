@@ -13,7 +13,7 @@
     <meta name="application-name" content="Grok" />
     <link rel="manifest" href="/manifest.webmanifest" />
     <link rel="apple-touch-icon" href="/icon-192.png" />
-    <link rel="stylesheet" href="/styles.css?v=33" />
+    <link rel="stylesheet" href="/styles.css?v=41" />
     <title>Grok</title>
     <script src="/marked.min.js"></script>
     <script src="/purify.min.js"></script>
@@ -107,21 +107,41 @@
         <div id="slash-menu" class="slash-menu hidden" role="listbox" aria-label="Tools"></div>
         <div id="previews"></div>
         <div class="row">
-          <button class="icon-btn" id="attach" type="button" title="Attach" aria-label="Attach photo">
+          <button
+            class="icon-btn"
+            id="actions-btn"
+            type="button"
+            title="Actions"
+            aria-label="Actions"
+            aria-haspopup="dialog"
+            aria-expanded="false"
+            aria-controls="actions-sheet"
+          >
             ＋
           </button>
-          <!-- Library (no capture) -->
-          <input id="file-library" type="file" accept="image/*" multiple class="hidden" />
-          <!-- Camera -->
-          <input id="file-camera" type="file" accept="image/*" capture="environment" class="hidden" />
+          <!-- iOS system picker: library and/or camera in one sheet -->
+          <input id="file-photos" type="file" accept="image/*" multiple class="hidden" />
+          <!-- Voice memo / audio file — works on plain http:// (no getUserMedia / HTTPS) -->
+          <input id="file-audio" type="file" accept="audio/*" class="hidden" />
           <textarea
             id="input"
             rows="1"
-            placeholder="Message Grok…  (/ for tools)"
+            placeholder="Message Grok…"
             enterkeyhint="send"
           ></textarea>
+          <button
+            class="icon-btn icon-btn-mic"
+            id="mic"
+            type="button"
+            title="Dictate with your voice"
+            aria-label="Dictate"
+            aria-pressed="false"
+          >
+            <span class="mic-glyph" aria-hidden="true"></span>
+          </button>
           <button class="icon-btn primary" id="send" type="button" aria-label="Send">↑</button>
         </div>
+        <div id="dictation-hint" class="dictation-hint hidden" aria-live="polite"></div>
       </div>
     </section>
 
@@ -167,16 +187,22 @@
       </aside>
     </div>
 
-    <!-- Attach sheet: library vs camera -->
-    <div id="attach-sheet" class="sheet hidden" aria-hidden="true">
-      <div class="sheet-backdrop" id="attach-backdrop"></div>
-      <div class="sheet-panel" role="dialog" aria-label="Add photo">
-        <button type="button" id="pick-library" class="sheet-btn">Photo library</button>
-        <button type="button" id="pick-camera" class="sheet-btn">Take photo</button>
-        <button type="button" id="attach-cancel" class="sheet-btn sheet-cancel">Cancel</button>
+    <!-- Actions: photo (system picker) + tools -->
+    <div id="actions-sheet" class="sheet hidden" aria-hidden="true">
+      <div class="sheet-backdrop" id="actions-backdrop"></div>
+      <div class="sheet-panel" role="dialog" aria-label="Actions">
+        <button type="button" id="action-photo" class="sheet-btn">
+          Photo
+          <span class="sheet-btn-sub">Library or camera</span>
+        </button>
+        <button type="button" id="action-tools" class="sheet-btn">
+          Tools
+          <span class="sheet-btn-sub">Slash commands &amp; agent tools</span>
+        </button>
+        <button type="button" id="actions-cancel" class="sheet-btn sheet-cancel">Cancel</button>
       </div>
     </div>
 
-    <script type="module" src="/app.js?v=33"></script>
+    <script type="module" src="/app.js?v=41"></script>
   </body>
 </html>

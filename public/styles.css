@@ -723,6 +723,17 @@ header .status.bad {
   border-color: #3a3a3a;
 }
 
+/* After dictation: draft is in the field — review before ↑ */
+.row textarea.dictation-draft {
+  border-color: #666;
+  background: #0e0e0e;
+  box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.08);
+  transition:
+    border-color 0.25s ease,
+    box-shadow 0.25s ease,
+    background 0.25s ease;
+}
+
 .row textarea::placeholder {
   color: var(--muted2);
 }
@@ -735,8 +746,14 @@ header .status.bad {
   background: #0a0a0a;
   color: var(--text);
   font-size: 18px;
+  line-height: 1;
   cursor: pointer;
   flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  -webkit-tap-highlight-color: transparent;
 }
 
 .icon-btn.primary {
@@ -748,6 +765,87 @@ header .status.bad {
 
 .icon-btn:disabled {
   opacity: 0.35;
+}
+
+/* Mic: flex-center the glyph so padding looks even */
+.icon-btn-mic {
+  position: relative;
+}
+
+/* Voice dictation — monochrome mic glyph, optically centered */
+.mic-glyph {
+  display: block;
+  width: 11px;
+  height: 16px;
+  position: relative;
+  border: 1.5px solid currentColor;
+  border-radius: 6px;
+  box-sizing: border-box;
+  /* Shift up slightly so stem/base don't look bottom-heavy */
+  transform: translateY(-1px);
+}
+
+.mic-glyph::before {
+  content: "";
+  position: absolute;
+  left: 50%;
+  bottom: -4px;
+  width: 9px;
+  height: 4px;
+  border: 1.5px solid currentColor;
+  border-top: 0;
+  border-radius: 0 0 7px 7px;
+  transform: translateX(-50%);
+  box-sizing: border-box;
+}
+
+.mic-glyph::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  bottom: -7px;
+  width: 1.5px;
+  height: 3px;
+  background: currentColor;
+  transform: translateX(-50%);
+  border-radius: 1px;
+}
+
+.icon-btn.mic-listening {
+  border-color: #c44;
+  background: #1a0808;
+  color: #f66;
+  box-shadow: 0 0 0 3px rgba(200, 60, 60, 0.2);
+  animation: mic-pulse 1.2s ease-in-out infinite;
+}
+
+@keyframes mic-pulse {
+  0%,
+  100% {
+    box-shadow: 0 0 0 2px rgba(200, 60, 60, 0.15);
+  }
+  50% {
+    box-shadow: 0 0 0 6px rgba(200, 60, 60, 0.08);
+  }
+}
+
+.icon-btn.mic-unsupported {
+  opacity: 0.35;
+}
+
+.dictation-hint {
+  font-size: 12px;
+  color: var(--muted);
+  padding: 0 4px 2px;
+  line-height: 1.35;
+}
+
+.dictation-hint.live {
+  color: #e8a0a0;
+}
+
+.dictation-hint.hidden {
+  display: none !important;
 }
 
 .hidden {
@@ -833,7 +931,7 @@ header .status.bad {
   color: #666;
 }
 
-/* ── Attach sheet (library / camera) ────────────────────── */
+/* ── Actions sheet (photo / tools) ──────────────────────── */
 .sheet {
   position: fixed;
   inset: 0;
@@ -872,6 +970,18 @@ header .status.bad {
   font-size: 16px;
   font-weight: 600;
   cursor: pointer;
+  text-align: left;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+}
+
+.sheet-btn-sub {
+  font-size: 12px;
+  font-weight: 500;
+  color: #888;
+  letter-spacing: 0;
 }
 
 .sheet-btn:active {
@@ -883,6 +993,8 @@ header .status.bad {
   color: #aaa;
   font-weight: 500;
   margin-top: 2px;
+  text-align: center;
+  align-items: center;
 }
 
 /* ── Agent send-target chip ─────────────────────────────── */
