@@ -152,20 +152,17 @@ export function isAppleMobileSpeech(g = globalThis) {
 }
 
 /**
- * Prefer record→Mac path (never rely on Web Speech for these cases).
+ * Prefer Mac MediaRecorder STT only when browser Web Speech is unavailable.
+ * With HTTPS, browser speech is real on-device STT (live text) — use it first.
  * @param {typeof globalThis} [g]
  * @returns {boolean}
  */
 export function preferServerDictation(g = globalThis) {
-  if (!isMediaRecorderDictationSupported(g) && !hasGetUserMedia(g)) {
-    // Still "prefer" server when secure context is missing on Apple — message
-    // path will explain HTTPS; Web Speech won't help there either.
-    return isAppleMobileSpeech(g) || isStandaloneDisplayMode(g);
-  }
+  // Never prefer Mac upload when the browser can do live SpeechRecognition
+  if (isSpeechRecognitionSupported(g)) return false;
   return (
-    isAppleMobileSpeech(g) ||
-    isStandaloneDisplayMode(g) ||
-    !isSpeechRecognitionSupported(g)
+    isMediaRecorderDictationSupported(g) ||
+    hasGetUserMedia(g)
   );
 }
 
@@ -199,32 +196,51 @@ export function isNativeAudioFileDictationSupported(g = globalThis) {
 
 /**
  * Path selection for the mic button (shipped entry for unit tests).
+ * Priority: browser live STT → Mac record/STT → keyboard Apple STT.
  * @param {typeof globalThis} [g]
- * @returns {"server-media"|"browser-speech"|"native-audio-file"|"unavailable"}
+ * @returns {"server-media"|"browser-speech"|"keyboard-stt"|"native-audio-file"|"unavailable"}
  */
 export function selectDictationPath(g = globalThis) {
   const secure = isSecureDictationContext(g);
-  const canLive =
+  const canRecord =
     secure &&
     (isMediaRecorderDictationSupported(g) || hasGetUserMedia(g));
 
-  if (
-    canLive &&
-    (preferServerDictation(g) || !isSpeechRecognitionSupported(g))
-  ) {
-    return "server-media";
-  }
-  if (
-    secure &&
-    isSpeechRecognitionSupported(g) &&
-    !preferServerDictation(g)
-  ) {
+  // 1) Real browser speech-to-text (live interim text) — needs HTTPS
+  if (secure && isSpeechRecognitionSupported(g)) {
     return "browser-speech";
   }
-  if (canLive) return "server-media";
-  // Plain http:// LAN — free path, no paid TLS
-  if (isNativeAudioFileDictationSupported(g)) return "native-audio-file";
+
+  // 2) Record on phone, STT on Mac (only when browser STT missing)
+  if (canRecord) {
+    return "server-media";
+  }
+
+  // 3) Plain http:// or no mic API — iPhone keyboard STT (also real Apple STT)
+  if (
+    isAppleMobileSpeech(g) ||
+    isStandaloneDisplayMode(g) ||
+    isNativeAudioFileDictationSupported(g)
+  ) {
+    return "keyboard-stt";
+  }
   return "unavailable";
+}
+
+/**
+ * Build free HTTPS live-mic URL from status payload + current location.
+ * @param {{ httpsPort?: number|null, httpsEnabled?: boolean, lanIps?: string[] }} status
+ * @param {{ protocol?: string, hostname?: string, port?: string }} [loc]
+ * @returns {string|null}
+ */
+export function buildFreeHttpsMicUrl(status, loc = globalThis.location) {
+  if (!status?.httpsEnabled || !status.httpsPort) return null;
+  const host = String(loc?.hostname || "").trim();
+  if (!host) return null;
+  // If opened via localhost, keep localhost; else keep current host (LAN IP)
+  const port = Number(status.httpsPort);
+  if (!Number.isFinite(port) || port <= 0) return null;
+  return `https://${host}:${port}/`;
 }
 
 /**
@@ -276,24 +292,49 @@ export function mergeDictationText(base, finals, interim = "") {
 
 /**
  * Extract final + interim strings from a SpeechRecognitionEvent-like object.
- * @param {{ results?: ArrayLike<{ isFinal?: boolean, 0?: { transcript?: string }, length?: number }> }} event
- * @param {number} [fromIndex=0]
+ *
+ * Always scans the full results list (not a cursor past interim slots).
+ * Advancing a cursor past non-final results caused the classic bug:
+ * first word becomes final, next interim replaces the display and drops
+ * the earlier final because it was never re-read.
+ *
+ * @param {{ results?: ArrayLike<{ isFinal?: boolean, 0?: { transcript?: string }, length?: number }>, resultIndex?: number }} event
+ * @param {number} [_fromIndex] ignored (kept for call-site compatibility)
  * @returns {{ finals: string[], interim: string, nextIndex: number }}
  */
-export function consumeRecognitionResults(event, fromIndex = 0) {
+export function consumeRecognitionResults(event, _fromIndex = 0) {
   const results = event?.results;
   const finals = [];
   let interim = "";
-  let i = Math.max(0, fromIndex | 0);
   const len = results?.length || 0;
-  for (; i < len; i++) {
+  for (let i = 0; i < len; i++) {
     const row = results[i];
-    const piece = String(row?.[0]?.transcript || "").trim();
+    const piece = String(row?.[0]?.transcript || "")
+      .replace(/\s+/g, " ")
+      .trim();
     if (!piece) continue;
-    if (row.isFinal) finals.push(piece);
-    else interim = piece;
+    if (row.isFinal) {
+      finals.push(piece);
+    } else {
+      // Keep the latest non-final hypothesis (may span one or more slots)
+      interim = interim ? `${interim} ${piece}` : piece;
+    }
   }
   return { finals, interim, nextIndex: len };
+}
+
+/**
+ * Pure session merge for live STT: base is text from before this recognition
+ * session; finals are all isFinal results this session; interim is current partial.
+ * Callers must REPLACE finals each event (not append), using consumeRecognitionResults.
+ *
+ * @param {string} base
+ * @param {string[]} sessionFinals
+ * @param {string} interim
+ * @returns {string}
+ */
+export function liveSpeechComposerText(base, sessionFinals, interim = "") {
+  return mergeDictationText(base, sessionFinals, interim);
 }
 
 /**

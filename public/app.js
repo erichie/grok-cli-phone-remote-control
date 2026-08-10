@@ -36,6 +36,7 @@ import {
   isNativeAudioFileDictationSupported,
   selectDictationPath,
   buildComposerDraft,
+  buildFreeHttpsMicUrl,
 } from "./voice-ui.mjs";
 
 const $ = (id) => document.getElementById(id);
@@ -76,6 +77,15 @@ const actionsBackdrop = $("actions-backdrop");
 const actionPhoto = $("action-photo");
 const actionTools = $("action-tools");
 const actionsCancel = $("actions-cancel");
+const dictationSheet = $("dictation-sheet");
+const dictationBackdrop = $("dictation-backdrop");
+const dictationKeyboardBtn = $("dictation-keyboard");
+const dictationHttpsBtn = $("dictation-https");
+const dictationMemoBtn = $("dictation-memo");
+const dictationCancelBtn = $("dictation-cancel");
+
+/** @type {string|null} free self-signed HTTPS URL from /api/status */
+let freeHttpsMicUrl = null;
 
 /** Base key — actual storage is per-agent: `${HISTORY_KEY}:${agentId}`. */
 const HISTORY_KEY = "phone_chat_history_v1";
@@ -1716,6 +1726,7 @@ async function checkStatus() {
       return false;
     }
     const j = await res.json();
+    freeHttpsMicUrl = buildFreeHttpsMicUrl(j, window.location);
     if (Array.isArray(j.agents)) {
       knownAgents = j.agents;
       selectedAgentId = normalizeSelectedAgentId(knownAgents, selectedAgentId);
@@ -1869,6 +1880,7 @@ async function doUnlock() {
     if (await checkStatus()) {
       await loadTools();
       await showChat();
+      await maybeAutoStartMicFromQuery();
     } else {
       alert(
         "Could not connect — check the secret and that the Mac server is running."
@@ -2170,16 +2182,22 @@ async function requestMicStream() {
 
 async function startServerDictation() {
   if (!isSecureDictationContext()) {
-    setDictationHint(speechRecognitionErrorMessage("insecure-context"));
+    // Auto-record needs free HTTPS — jump there if we know the URL
+    if (!freeHttpsMicUrl) await refreshFreeHttpsMicUrl();
+    if (freeHttpsMicUrl && navigateToFreeHttpsAutoMic()) return;
+    setDictationHint(
+      "Live auto-record needs free HTTPS on the Mac bridge. Restart npm start (openssl), or use Keyboard dictate."
+    );
+    openDictationSheet();
     return;
   }
   hideSlashMenu();
+  closeDictationSheet();
   setMicUi(true);
-  // This string means getUserMedia is about to run — iOS should prompt now.
-  setDictationHint("Requesting microphone…", true);
+  // getUserMedia must be among the first awaits after the tap (iOS gesture)
+  setDictationHint("Listening… tap mic again when done.", true);
 
   try {
-    // First await = permission prompt (must stay close to the tap gesture).
     mediaStream = await requestMicStream();
   } catch (e) {
     setMicUi(false);
@@ -2252,9 +2270,9 @@ async function startServerDictation() {
 
   try {
     // timeslice helps some iOS builds flush data
-    rec.start(1000);
+    rec.start(250);
     setDictationHint(
-      "Recording… tap the mic when finished — your words will appear here to review before send.",
+      "Recording… tap mic again to stop — text appears to review before send.",
       true
     );
   } catch (e) {
@@ -2291,12 +2309,11 @@ function createSpeechRecognition() {
   };
 
   rec.onresult = (ev) => {
-    const { finals, interim, nextIndex } = consumeRecognitionResults(
-      ev,
-      dictationResultIndex
-    );
-    dictationResultIndex = nextIndex;
-    if (finals.length) dictationFinals.push(...finals);
+    // REPLACE session finals every event (full scan). Do not push + cursor past
+    // interim — that dropped finalized words when the next interim arrived.
+    const { finals, interim } = consumeRecognitionResults(ev);
+    dictationFinals = finals;
+    dictationResultIndex = finals.length;
     applyDictationToInput(interim);
   };
 
@@ -2343,7 +2360,13 @@ function beginBrowserRecognitionSession() {
   if (!rec) {
     dictationWantListening = false;
     setMicUi(false);
-    setDictationHint("Browser speech unavailable — try again.");
+    // Fall back to record→Mac only if live STT API is missing
+    if (isMediaRecorderDictationSupported() || hasGetUserMedia()) {
+      setDictationHint("Browser STT unavailable — using on-device recording…", true);
+      void startServerDictation();
+      return;
+    }
+    setDictationHint("Browser speech unavailable — try Keyboard dictate.");
     return;
   }
   speechRec = rec;
@@ -2351,6 +2374,7 @@ function beginBrowserRecognitionSession() {
   try {
     speechRec.start();
     setMicUi(true);
+    setDictationHint("Listening… speak now. Tap mic to stop.", true);
   } catch (e) {
     if (e?.name === "InvalidStateError" && dictationWantListening) {
       setMicUi(true);
@@ -2359,6 +2383,10 @@ function beginBrowserRecognitionSession() {
     dictationWantListening = false;
     setMicUi(false);
     detachSpeechRec();
+    if (isMediaRecorderDictationSupported() || hasGetUserMedia()) {
+      void startServerDictation();
+      return;
+    }
     setDictationHint(
       e?.message
         ? `Could not start mic: ${e.message}`
@@ -2369,33 +2397,64 @@ function beginBrowserRecognitionSession() {
 
 async function startBrowserDictation() {
   if (!isSecureDictationContext()) {
+    if (!freeHttpsMicUrl) await refreshFreeHttpsMicUrl();
+    if (freeHttpsMicUrl && navigateToFreeHttpsAutoMic()) return;
     setDictationHint(speechRecognitionErrorMessage("insecure-context"));
     return;
   }
   hideSlashMenu();
+  closeDictationSheet();
   promoteDictationBaseFromInput();
   dictationWantListening = true;
   dictationMode = "browser";
   setMicUi(true);
-  setDictationHint("Starting…", true);
+  setDictationHint("Listening… speak now. Words appear live.", true);
   beginBrowserRecognitionSession();
 }
 
 /**
- * Plain http:// path: system voice-memo / audio file picker (no getUserMedia).
- * Works on iOS Home Screen without HTTPS or Tailscale.
+ * Real iPhone speech-to-text via the system keyboard mic.
+ * Works on plain http:// PWA — Apple’s own STT, words appear live in the box.
  */
+function startKeyboardDictationMode() {
+  closeDictationSheet();
+  hideSlashMenu();
+  clearDictationDraftUi();
+  if (!input) return;
+  input.classList.add("dictation-draft");
+  try {
+    input.focus({ preventScroll: false });
+  } catch {
+    try {
+      input.focus();
+    } catch {
+      /* ignore */
+    }
+  }
+  // Nudge keyboard open on iOS
+  try {
+    const len = input.value.length;
+    input.setSelectionRange(len, len);
+  } catch {
+    /* ignore */
+  }
+  setDictationHint(
+    "Keyboard speech-to-text: tap 🎤 on the iPhone keyboard and speak. Words appear here live — then ↑ to send.",
+    true
+  );
+}
+
 function startNativeAudioFileDictation() {
+  closeDictationSheet();
   if (!fileAudio) {
     setDictationHint("Audio picker missing — hard-refresh the app.");
     return;
   }
   hideSlashMenu();
   setDictationHint(
-    "Record a voice memo (or pick audio), then Open — text appears here to review before send.",
+    "Pick or record audio — Mac will turn it into text in the box.",
     true
   );
-  // Must stay synchronous with the tap for iOS
   fileAudio.click();
 }
 
@@ -2418,9 +2477,61 @@ if (fileAudio) {
   };
 }
 
+function openDictationSheet() {
+  if (!dictationSheet) {
+    startKeyboardDictationMode();
+    return;
+  }
+  // Update HTTPS row
+  if (dictationHttpsBtn) {
+    if (freeHttpsMicUrl) {
+      dictationHttpsBtn.disabled = false;
+      dictationHttpsBtn.classList.remove("sheet-btn-disabled");
+      const sub = dictationHttpsBtn.querySelector(".sheet-btn-sub");
+      if (sub) {
+        sub.textContent = `Open ${freeHttpsMicUrl} — free self-signed cert, no paid plan`;
+      }
+    } else {
+      dictationHttpsBtn.disabled = true;
+      const sub = dictationHttpsBtn.querySelector(".sheet-btn-sub");
+      if (sub) {
+        sub.textContent =
+          "Restart Mac bridge with openssl for free HTTPS live mic";
+      }
+    }
+  }
+  dictationSheet.classList.remove("hidden");
+  dictationSheet.setAttribute("aria-hidden", "false");
+}
+
+function closeDictationSheet() {
+  if (!dictationSheet) return;
+  dictationSheet.classList.add("hidden");
+  dictationSheet.setAttribute("aria-hidden", "true");
+}
+
 /**
- * Prefer MediaRecorder when HTTPS allows it; otherwise native voice-memo file
- * picker (works on plain http:// LAN — free, no Tailscale).
+ * Jump to free self-signed HTTPS with automic=1 so recording starts on load.
+ * @returns {boolean} true if navigation started
+ */
+function navigateToFreeHttpsAutoMic() {
+  if (!freeHttpsMicUrl) return false;
+  try {
+    const url = new URL(freeHttpsMicUrl);
+    url.searchParams.set("automic", "1");
+    setDictationHint("Starting live mic…", true);
+    window.location.href = url.toString();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * One-tap dictation:
+ * - HTTPS + Web Speech API → live browser STT (preferred — no Mac)
+ * - HTTPS without Web Speech → record + Mac STT fallback
+ * - HTTP → free HTTPS for live paths, else keyboard Apple STT
  */
 async function startDictation() {
   if (dictationUploading) {
@@ -2431,24 +2542,42 @@ async function startDictation() {
   // Toggle off (browser live or recording)
   if (dictationActive || dictationWantListening || mediaRecorder) {
     const wasServer = dictationMode === "server" || !!mediaRecorder;
+    const wasBrowser = dictationMode === "browser";
     stopDictation({ keepHint: wasServer });
     if (wasServer) setDictationHint("Stopping…", true);
+    else if (wasBrowser) {
+      setDictationHint(
+        input?.value?.trim()
+          ? "Draft ready — edit, then tap ↑ to send."
+          : ""
+      );
+    }
     return;
   }
 
-  // Shared path selection (unit-tested in voice-ui.mjs)
   const path = selectDictationPath();
-  if (path === "server-media") {
-    await startServerDictation();
-    return;
-  }
+
+  // Prefer real browser speech-to-text (live words, no Mac upload)
   if (path === "browser-speech") {
     await startBrowserDictation();
     return;
   }
-  if (path === "native-audio-file" && fileAudio) {
-    // Plain http:// LAN — free, no paid TLS
-    startNativeAudioFileDictation();
+  if (path === "server-media") {
+    // Only when Web Speech is missing (typical older WebKit)
+    await startServerDictation();
+    return;
+  }
+
+  // On plain http://, jump to free HTTPS so browser STT / live mic can work
+  if (!freeHttpsMicUrl) {
+    await refreshFreeHttpsMicUrl();
+  }
+  if (freeHttpsMicUrl && navigateToFreeHttpsAutoMic()) {
+    return;
+  }
+
+  if (path === "keyboard-stt" || path === "native-audio-file") {
+    openDictationSheet();
     return;
   }
 
@@ -2457,17 +2586,99 @@ async function startDictation() {
   );
 }
 
+/**
+ * After landing on free HTTPS with ?automic=1, start dictation once.
+ * Prefers browser STT when available.
+ */
+async function maybeAutoStartMicFromQuery() {
+  let want = false;
+  try {
+    const u = new URL(window.location.href);
+    want = u.searchParams.get("automic") === "1";
+    if (want) {
+      u.searchParams.delete("automic");
+      const qs = u.searchParams.toString();
+      history.replaceState(
+        null,
+        "",
+        u.pathname + (qs ? `?${qs}` : "") + u.hash
+      );
+    }
+  } catch {
+    return;
+  }
+  if (!want) return;
+  if (!isSecureDictationContext()) {
+    setDictationHint(
+      "Live mic needs the free HTTPS page. Restart npm start on the Mac (openssl)."
+    );
+    return;
+  }
+  if (!getSecret()) {
+    setDictationHint("Connect with your secret, then tap the mic.");
+    return;
+  }
+  setDictationHint("Starting…", true);
+  // Prefer browser STT over Mac transcription
+  const path = selectDictationPath();
+  if (path === "browser-speech") {
+    await startBrowserDictation();
+  } else {
+    await startServerDictation();
+  }
+}
+
 function initMicButton() {
   if (!micBtn) return;
-  // Always tappable — we have voice-memo fallback on http://
   micBtn.classList.remove("mic-unsupported");
-  micBtn.title = "Dictate with your voice";
+  micBtn.title = "Hold-free: tap to record, tap again to stop";
   micBtn.addEventListener("click", (e) => {
     e.preventDefault();
     void startDictation();
   });
+  if (dictationBackdrop) {
+    dictationBackdrop.onclick = () => closeDictationSheet();
+  }
+  if (dictationCancelBtn) {
+    dictationCancelBtn.onclick = () => closeDictationSheet();
+  }
+  if (dictationKeyboardBtn) {
+    dictationKeyboardBtn.onclick = () => startKeyboardDictationMode();
+  }
+  if (dictationMemoBtn) {
+    dictationMemoBtn.onclick = () => startNativeAudioFileDictation();
+  }
+  if (dictationHttpsBtn) {
+    dictationHttpsBtn.onclick = () => {
+      closeDictationSheet();
+      if (!freeHttpsMicUrl) {
+        setDictationHint(
+          "Free HTTPS not running. On the Mac: restart npm start (needs openssl)."
+        );
+        return;
+      }
+      navigateToFreeHttpsAutoMic();
+    };
+  }
 }
 initMicButton();
+
+/** Refresh free HTTPS URL from status (for live mic on iPhone). */
+async function refreshFreeHttpsMicUrl() {
+  const secret = getSecret();
+  if (!secret) return;
+  try {
+    const res = await fetch("/api/status", {
+      headers: { Authorization: `Bearer ${secret}` },
+      cache: "no-store",
+    });
+    if (!res.ok) return;
+    const j = await res.json();
+    freeHttpsMicUrl = buildFreeHttpsMicUrl(j, window.location);
+  } catch {
+    /* offline */
+  }
+}
 
 // ── Attach: library + camera ───────────────────────────────────────────────
 
@@ -2895,6 +3106,8 @@ if (getSecret()) {
     if (ok) {
       await loadTools();
       await showChat();
+      // Free HTTPS landing with ?automic=1 → start recording immediately
+      await maybeAutoStartMicFromQuery();
     }
   });
 } else {

@@ -32,3 +32,4 @@ coverage/
 scratch/
 tmp/
 *.tmp
+.scratch-dictation-test/

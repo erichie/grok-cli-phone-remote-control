@@ -997,6 +997,14 @@ header .status.bad {
   align-items: center;
 }
 
+.sheet-lead {
+  margin: 0 4px 4px;
+  font-size: 13px;
+  line-height: 1.4;
+  color: #999;
+  font-weight: 500;
+}
+
 /* ── Agent send-target chip ─────────────────────────────── */
 .agent-chip-bar {
   display: flex;

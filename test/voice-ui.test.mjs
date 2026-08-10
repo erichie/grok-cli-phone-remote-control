@@ -25,6 +25,7 @@ import {
   isNativeAudioFileDictationSupported,
   selectDictationPath,
   buildComposerDraft,
+  buildFreeHttpsMicUrl,
 } from "../public/voice-ui.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -138,11 +139,33 @@ test("consumeRecognitionResults splits final vs interim", () => {
   assert.deepEqual(a.finals, ["one", "two"]);
   assert.equal(a.interim, "three");
   assert.equal(a.nextIndex, 3);
+});
 
-  // Resume from index 2 — only interim
-  const b = consumeRecognitionResults(event, 2);
-  assert.deepEqual(b.finals, []);
-  assert.equal(b.interim, "three");
+test("consumeRecognitionResults keeps earlier finals when new interim arrives", () => {
+  // Regression: first word final, then keep talking (new interim slot)
+  const first = {
+    results: [{ isFinal: false, 0: { transcript: "hello" } }],
+  };
+  const a = consumeRecognitionResults(first);
+  assert.deepEqual(a.finals, []);
+  assert.equal(a.interim, "hello");
+  // Simulate live merge as the app does: replace finals each time
+  let sessionFinals = a.finals;
+  let text = mergeDictationText("", sessionFinals, a.interim);
+  assert.equal(text, "hello");
+
+  const second = {
+    results: [
+      { isFinal: true, 0: { transcript: "hello" } },
+      { isFinal: false, 0: { transcript: "world" } },
+    ],
+  };
+  const b = consumeRecognitionResults(second);
+  sessionFinals = b.finals; // replace, do not skip index 0
+  text = mergeDictationText("", sessionFinals, b.interim);
+  assert.deepEqual(b.finals, ["hello"]);
+  assert.equal(b.interim, "world");
+  assert.equal(text, "hello world");
 });
 
 test("speechRecognitionErrorMessage covers permission and network", () => {
@@ -153,7 +176,7 @@ test("speechRecognitionErrorMessage covers permission and network", () => {
   assert.match(speechRecognitionErrorMessage("insecure-context"), /HTTPS/i);
 });
 
-test("iOS / standalone prefers server (MediaRecorder) dictation", () => {
+test("iOS / standalone without Web Speech falls back to server-media", () => {
   const iosPwa = {
     isSecureContext: true,
     navigator: {
@@ -168,11 +191,31 @@ test("iOS / standalone prefers server (MediaRecorder) dictation", () => {
   };
   iosPwa.MediaRecorder.isTypeSupported = () => true;
   assert.equal(isAppleMobileSpeech(iosPwa), true);
-  assert.equal(isStandaloneDisplayMode(iosPwa), true);
   assert.equal(isSpeechRecognitionSupported(iosPwa), false);
   assert.equal(isMediaRecorderDictationSupported(iosPwa), true);
   assert.equal(preferServerDictation(iosPwa), true);
+  assert.equal(selectDictationPath(iosPwa), "server-media");
   assert.equal(dictationBlockedReason(iosPwa), "");
+});
+
+test("HTTPS + Web Speech prefers browser-speech over Mac STT", () => {
+  function FakeRec() {}
+  const g = {
+    isSecureContext: true,
+    navigator: {
+      userAgent: "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X)",
+      platform: "iPhone",
+      maxTouchPoints: 5,
+      mediaDevices: { getUserMedia: async () => ({}) },
+    },
+    MediaRecorder: function MediaRecorder() {},
+    webkitSpeechRecognition: FakeRec,
+    matchMedia: () => ({ matches: false }),
+  };
+  g.MediaRecorder.isTypeSupported = () => true;
+  assert.equal(isSpeechRecognitionSupported(g), true);
+  assert.equal(preferServerDictation(g), false);
+  assert.equal(selectDictationPath(g), "browser-speech");
 });
 
 test("insecure HTTP allows native voice-memo path (no paid HTTPS required)", () => {
@@ -191,10 +234,27 @@ test("insecure HTTP allows native voice-memo path (no paid HTTPS required)", () 
   assert.equal(isNativeAudioFileDictationSupported(lan), true);
   // Must not block — file picker works over plain http://
   assert.equal(dictationBlockedReason(lan), "");
-  assert.equal(selectDictationPath(lan), "native-audio-file");
+  // Real Apple STT via keyboard — not the terrible photo/video file sheet
+  assert.equal(selectDictationPath(lan), "keyboard-stt");
 });
 
-test("selectDictationPath: iOS PWA secure uses server-media", () => {
+test("buildFreeHttpsMicUrl builds free self-signed URL", () => {
+  assert.equal(
+    buildFreeHttpsMicUrl(
+      { httpsEnabled: true, httpsPort: 8788 },
+      { hostname: "10.0.0.5" }
+    ),
+    "https://10.0.0.5:8788/"
+  );
+  assert.equal(
+    buildFreeHttpsMicUrl({ httpsEnabled: false, httpsPort: 8788 }, {
+      hostname: "10.0.0.5",
+    }),
+    null
+  );
+});
+
+test("selectDictationPath: iOS PWA secure without Web Speech uses server-media", () => {
   const g = {
     isSecureContext: true,
     document: { createElement: () => ({}) },
@@ -239,15 +299,18 @@ test("desktop with Web Speech does not force server path", () => {
   assert.equal(selectDictationPath(desktop), "browser-speech");
 });
 
-test("client wires selectDictationPath + native file-audio (structural)", () => {
+test("client wires selectDictationPath + keyboard STT + free HTTPS (structural)", () => {
   const app = readFileSync(join(ROOT, "public/app.js"), "utf8");
   const html = readFileSync(join(ROOT, "public/index.html"), "utf8");
   // Mic entry uses shared path selection (not a reimplemented branch)
   assert.match(app, /selectDictationPath\s*\(/);
-  assert.match(app, /path === "native-audio-file"/);
+  assert.match(app, /path === "keyboard-stt"/);
   assert.match(app, /path === "server-media"/);
   assert.match(app, /path === "browser-speech"/);
-  assert.match(app, /startNativeAudioFileDictation/);
+  assert.match(app, /startKeyboardDictationMode/);
+  assert.match(app, /navigateToFreeHttpsAutoMic|automic/);
+  assert.match(app, /maybeAutoStartMicFromQuery/);
+  assert.match(app, /buildFreeHttpsMicUrl/);
   assert.match(app, /buildComposerDraft/);
   // Draft only — upload success must not auto-send chat
   assert.match(app, /appendTranscriptToInput/);
@@ -258,14 +321,10 @@ test("client wires selectDictationPath + native file-audio (structural)", () => 
   assert.match(uploadFn, /appendTranscriptToInput\(text\)/);
   assert.doesNotMatch(uploadFn, /\/api\/chat/);
   assert.doesNotMatch(uploadFn, /sendMessage\s*\(/);
-  // Native picker in HTML (plain http path)
-  assert.match(html, /id="file-audio"/);
-  assert.match(html, /accept="audio\/\*"/);
   assert.match(html, /id="mic"/);
-  // No HTTPS-only hard block for mic init
-  assert.match(app, /Always tappable/);
-  assert.doesNotMatch(
-    app,
-    /mic-unsupported.*true|isSecureDictationContext\(\)\s*\&\&\s*!.*return/
-  );
+  assert.match(html, /id="dictation-sheet"/);
+  assert.match(html, /id="dictation-keyboard"/);
+  assert.match(html, /id="dictation-https"/);
+  // Real Apple STT guidance (keyboard), not photo library sheet as primary
+  assert.match(app, /Keyboard speech-to-text|keyboard 🎤|iPhone keyboard/);
 });

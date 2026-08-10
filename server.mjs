@@ -12,6 +12,7 @@
  *   # on phone (same Wi‑Fi / Tailscale): http://<mac-ip>:8787
  */
 import http from "node:http";
+import https from "node:https";
 import { spawn } from "node:child_process";
 import {
   createReadStream,
@@ -67,10 +68,19 @@ import {
   processDictationAudio,
   normalizeDictationSuccess,
 } from "./lib/dictation.mjs";
+import { ensurePhoneTlsMaterial, listLanIPv4 } from "./lib/phone-tls.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PUBLIC = join(__dirname, "public");
 const PORT = Number(process.env.PHONE_CHAT_PORT || 8787);
+/** Free self-signed HTTPS for live iPhone mic (no paid Tailscale Serve). */
+const HTTPS_PORT = Number(
+  process.env.PHONE_CHAT_HTTPS_PORT ||
+    (Number.isFinite(PORT) ? PORT + 1 : 8788)
+);
+const TLS_DISABLED =
+  process.env.PHONE_CHAT_TLS === "0" ||
+  process.env.PHONE_CHAT_TLS === "false";
 const HOST = process.env.PHONE_CHAT_HOST || "0.0.0.0";
 const SECRET = (process.env.PHONE_CHAT_SECRET || "").trim();
 const CWD =
@@ -2223,9 +2233,13 @@ async function handleJobsList(req, res) {
   });
 }
 
+/** Filled when free local HTTPS is listening (for phone live mic). */
+let httpsListenInfo = null;
+
 async function handleStatus(req, res) {
   if (!authOk(req)) return sendJson(res, 401, { error: "unauthorized" });
   const agents = registry.list();
+  const lanIps = listLanIPv4();
   sendJson(res, 200, {
     ok: true,
     cwd: CWD,
@@ -2241,6 +2255,14 @@ async function handleStatus(req, res) {
     agentCount: agents.length,
     maxAgents: registry.maxAgents,
     turnCount: conversation.turns?.length || 0,
+    httpPort: PORT,
+    httpsPort: httpsListenInfo?.port || null,
+    httpsEnabled: !!httpsListenInfo,
+    lanIps,
+    // Free self-signed — no paid Tailscale Serve required for live mic
+    liveMicHint: httpsListenInfo
+      ? `For live in-page mic on iPhone, open https://<mac-ip>:${httpsListenInfo.port} once (trust the free cert), then re-add to Home Screen.`
+      : null,
   });
 }
 
@@ -2881,7 +2903,7 @@ function serveStatic(req, res) {
   createReadStream(file).pipe(res);
 }
 
-const server = http.createServer(async (req, res) => {
+async function onRequest(req, res) {
   if (req.method === "OPTIONS") {
     res.writeHead(204, {
       "Access-Control-Allow-Origin": "*",
@@ -2972,20 +2994,58 @@ const server = http.createServer(async (req, res) => {
     console.error(e);
     if (!res.headersSent) sendJson(res, 500, { error: String(e.message || e) });
   }
-});
+}
 
-server.listen(PORT, HOST, () => {
+const server = http.createServer(onRequest);
+
+function printBanner() {
+  const ips = listLanIPv4();
+  const ipHint = ips[0] || "<this-mac-ip>";
+  const httpsLine = httpsListenInfo
+    ? `  https:  https://${HOST}:${httpsListenInfo.port}  (free self-signed — live iPhone mic)
+  open:   https://${ipHint}:${httpsListenInfo.port}
+           Trust the cert once in Safari, then Add to Home Screen for live mic.`
+    : `  https:  (disabled — set openssl available; PHONE_CHAT_TLS=0 to silence)`;
   console.log(`
-grok-cli-phone-remote-control listening on http://${HOST}:${PORT}
+grok-cli-phone-remote-control
+  http:   http://${HOST}:${PORT}
+${httpsLine}
   cwd:    ${CWD}
   inbox:  ${INBOX}
   secret: (PHONE_CHAT_SECRET set)
 
-On your phone (same Wi‑Fi or Tailscale):
-  1. Open http://<this-mac-ip>:${PORT}
-  2. Enter the secret once
-  3. Share → Add to Home Screen (Safari) for installable PWA
+Phone:
+  • Chat works on plain http://${ipHint}:${PORT} (free).
+  • Live in-page mic (tap → speak → stop): use the free https:// URL above
+    (self-signed, no paid Tailscale Serve). Or use the keyboard 🎤 on http.
+  • Add to Home Screen after opening the URL you want.
 
 Keep this process running while you chat.
 `);
+}
+
+server.listen(PORT, HOST, () => {
+  if (TLS_DISABLED) {
+    printBanner();
+    return;
+  }
+  const material = ensurePhoneTlsMaterial({
+    dir: join(homedir(), ".grok", "phone-pwa-tls"),
+  });
+  if (!material) {
+    printBanner();
+    return;
+  }
+  const httpsServer = https.createServer(
+    { key: material.key, cert: material.cert },
+    onRequest
+  );
+  httpsServer.on("error", (e) => {
+    console.warn("[tls] HTTPS listen failed:", e.message);
+    printBanner();
+  });
+  httpsServer.listen(HTTPS_PORT, HOST, () => {
+    httpsListenInfo = { port: HTTPS_PORT };
+    printBanner();
+  });
 });

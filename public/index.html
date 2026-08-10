@@ -13,7 +13,7 @@
     <meta name="application-name" content="Grok" />
     <link rel="manifest" href="/manifest.webmanifest" />
     <link rel="apple-touch-icon" href="/icon-192.png" />
-    <link rel="stylesheet" href="/styles.css?v=41" />
+    <link rel="stylesheet" href="/styles.css?v=45" />
     <title>Grok</title>
     <script src="/marked.min.js"></script>
     <script src="/purify.min.js"></script>
@@ -145,6 +145,29 @@
       </div>
     </section>
 
+    <!-- Dictation options when live mic needs free HTTPS -->
+    <div id="dictation-sheet" class="sheet hidden" aria-hidden="true">
+      <div class="sheet-backdrop" id="dictation-backdrop"></div>
+      <div class="sheet-panel" role="dialog" aria-label="Dictate">
+        <p class="sheet-lead">
+          Real speech-to-text on iPhone:
+        </p>
+        <button type="button" id="dictation-keyboard" class="sheet-btn">
+          Keyboard dictate
+          <span class="sheet-btn-sub">Uses the iPhone keyboard 🎤 — live STT, works on http://</span>
+        </button>
+        <button type="button" id="dictation-https" class="sheet-btn">
+          Live mic (free HTTPS)
+          <span class="sheet-btn-sub">Open self-signed secure URL once — no paid Tailscale</span>
+        </button>
+        <button type="button" id="dictation-memo" class="sheet-btn">
+          Voice memo file
+          <span class="sheet-btn-sub">Record or pick audio, Mac transcribes</span>
+        </button>
+        <button type="button" id="dictation-cancel" class="sheet-btn sheet-cancel">Cancel</button>
+      </div>
+    </div>
+
     <!-- Left menu: jobs + concurrent agents on the Mac -->
     <div id="activity-drawer" class="activity-drawer hidden" aria-hidden="true">
       <div class="activity-backdrop" id="activity-backdrop"></div>
@@ -203,6 +226,6 @@
       </div>
     </div>
 
-    <script type="module" src="/app.js?v=41"></script>
+    <script type="module" src="/app.js?v=45"></script>
   </body>
 </html>
