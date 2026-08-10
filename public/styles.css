@@ -61,8 +61,9 @@ header {
 header .header-left {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 8px;
   min-width: 0;
+  flex: 1;
 }
 
 header h1 {
@@ -71,14 +72,16 @@ header h1 {
   margin: 0;
   letter-spacing: -0.03em;
   color: var(--white);
+  flex-shrink: 0;
 }
 
 header .header-right {
   display: flex;
   align-items: center;
   gap: 8px;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   justify-content: flex-end;
+  flex-shrink: 0;
 }
 
 /* Left hamburger — opens jobs/agents menu */
@@ -143,17 +146,6 @@ header .header-right {
 }
 
 .menu-badge.hidden {
-  display: none;
-}
-
-/* Get result / Stop & show — primary recovery, next to Reset */
-header .header-job-actions {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-}
-
-header .header-job-actions.hidden {
   display: none;
 }
 
@@ -656,10 +648,11 @@ header .status.bad {
 #composer {
   border-top: 1px solid var(--border-soft);
   background: #000;
-  padding: 10px 12px calc(12px + env(safe-area-inset-bottom));
+  /* Use home-indicator inset only (no extra 12px stack) so the row sits closer to the bottom */
+  padding: 8px 12px max(6px, env(safe-area-inset-bottom, 0px));
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 6px;
 }
 
 #previews {
@@ -1005,13 +998,14 @@ header .status.bad {
   font-weight: 500;
 }
 
-/* ── Agent send-target chip ─────────────────────────────── */
+/* ── Agent send-target chip (top bar, next to title) ─────── */
 .agent-chip-bar {
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 6px 18px 0;
-  flex-shrink: 0;
+  gap: 6px;
+  min-width: 0;
+  flex-shrink: 1;
+  margin-left: 2px;
 }
 
 .agent-chip-bar.hidden {
@@ -1019,11 +1013,12 @@ header .status.bad {
 }
 
 .agent-chip-label {
-  font-size: 11px;
+  font-size: 10px;
   color: var(--muted2);
   font-weight: 500;
   text-transform: uppercase;
   letter-spacing: 0.04em;
+  flex-shrink: 0;
 }
 
 .agent-chip {
@@ -1032,14 +1027,15 @@ header .status.bad {
   color: #ddd;
   font-size: 12px;
   font-weight: 600;
-  padding: 5px 12px;
+  padding: 5px 11px;
   border-radius: 999px;
   cursor: pointer;
-  max-width: 70%;
+  max-width: min(42vw, 160px);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
   -webkit-tap-highlight-color: transparent;
+  flex-shrink: 1;
 }
 
 .agent-chip:active {
@@ -1050,6 +1046,13 @@ header .status.bad {
 .agent-chip.busy {
   border-color: #555;
   color: #fff;
+}
+
+/* Narrow phones: drop “To” label, keep the chip */
+@media (max-width: 360px) {
+  .agent-chip-label {
+    display: none;
+  }
 }
 
 /* ── Left menu drawer (jobs + multi-agent) ──────────────── */
@@ -1172,6 +1175,73 @@ header .status.bad {
   font-size: 12px;
   line-height: 1.4;
   color: #666;
+}
+
+.voice-trigger-label {
+  display: block;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  color: #666;
+  margin: 0 0 6px;
+}
+
+.voice-trigger-input {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 12px 12px;
+  border: 1px solid #2a2a2a;
+  border-radius: 12px;
+  background: #0a0a0a;
+  color: #fff;
+  font-size: 16px;
+  font-weight: 500;
+  outline: none;
+  -webkit-appearance: none;
+  appearance: none;
+}
+
+.voice-trigger-input:focus {
+  border-color: #444;
+  background: #0e0e0e;
+}
+
+.voice-trigger-input::placeholder {
+  color: #555;
+}
+
+.voice-trigger-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 10px;
+}
+
+.voice-trigger-save {
+  border: 1px solid #2a2a2a;
+  border-radius: 10px;
+  background: #161616;
+  color: #fff;
+  font-size: 13px;
+  font-weight: 600;
+  padding: 10px 14px;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.voice-trigger-save:active {
+  background: #1e1e1e;
+}
+
+.voice-trigger-status {
+  font-size: 12px;
+  color: #6a9;
+  min-height: 1.2em;
+}
+
+.voice-trigger-status.is-error {
+  color: #c77;
 }
 
 .activity-list {

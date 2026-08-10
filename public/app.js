@@ -2,11 +2,7 @@ import {
   mergeHostHistory,
   ensureActiveJobBotMessages,
 } from "./history-merge.mjs";
-import {
-  buildThinkingHtml,
-  shouldShowJobRecovery,
-  nextHeaderJobVisibility,
-} from "./thinking-ui.mjs";
+import { buildThinkingHtml } from "./thinking-ui.mjs";
 import {
   normalizeSelectedAgentId,
   agentStatusLine,
@@ -37,6 +33,11 @@ import {
   selectDictationPath,
   buildComposerDraft,
   buildFreeHttpsMicUrl,
+  matchSendTrigger,
+  DEFAULT_SEND_TRIGGERS,
+  parseSendTriggerInput,
+  formatSendTriggersForInput,
+  primarySendTrigger,
 } from "./voice-ui.mjs";
 
 const $ = (id) => document.getElementById(id);
@@ -47,9 +48,6 @@ const messages = $("messages");
 const scrollBottomBtn = $("scroll-bottom-btn");
 const connEl = $("conn");
 const resetBtn = $("reset-btn");
-const headerJobActions = $("header-job-actions");
-const headerGetResult = $("header-get-result");
-const headerStopShow = $("header-stop-show");
 const menuBtn = $("menu-btn");
 const menuBadge = $("menu-badge");
 const activityDrawer = $("activity-drawer");
@@ -83,9 +81,16 @@ const dictationKeyboardBtn = $("dictation-keyboard");
 const dictationHttpsBtn = $("dictation-https");
 const dictationMemoBtn = $("dictation-memo");
 const dictationCancelBtn = $("dictation-cancel");
+const voiceTriggerInput = $("voice-trigger-input");
+const voiceTriggerSave = $("voice-trigger-save");
+const voiceTriggerReset = $("voice-trigger-reset");
+const voiceTriggerStatus = $("voice-trigger-status");
 
 /** @type {string|null} free self-signed HTTPS URL from /api/status */
 let freeHttpsMicUrl = null;
+/** Prevent double auto-send from rapid STT events */
+let autoSendInFlight = false;
+const SEND_TRIGGER_KEY = "phone_chat_send_triggers";
 
 /** Base key — actual storage is per-agent: `${HISTORY_KEY}:${agentId}`. */
 const HISTORY_KEY = "phone_chat_history_v1";
@@ -257,7 +262,7 @@ function setThinking(thinkingEl, opts = {}) {
     tools: opts.tools,
     thought: opts.thought,
   });
-  // Keep header recovery controls in sync when thinking is shown for a job
+  // Job progress; recovery (if needed) lives in Menu → Jobs
   if (opts.jobId) {
     syncHeaderJobActions(opts.jobId, "running");
   }
@@ -559,7 +564,7 @@ function addMsg(role, text, opts = {}) {
   // New user messages pin to bottom; bot stream only follows if user is already there
   scrollBottom({ force: role === "user" || opts.forceScroll === true });
 
-  // Recovery controls live in the header (next to Reset), not under each bubble
+  // Job recovery lives in Menu → Jobs, not under each bubble
   if (role === "bot" && opts.jobId) {
     syncHeaderJobActions(opts.jobId, opts.jobStatus);
   }
@@ -590,11 +595,8 @@ function isTerminalJobStatus(st) {
   return st === "done" || st === "error" || st === "cancelled";
 }
 
-/** @type {string|null} job currently bound to header Get result / Stop & show */
-let headerActiveJobId = null;
-
 /**
- * Find the bot message element for a job (for pull/stop handlers).
+ * Find the bot message element for a job.
  * @param {string} jobId
  */
 function findBotMsgEl(jobId) {
@@ -606,33 +608,19 @@ function findBotMsgEl(jobId) {
 }
 
 /**
- * Primary recovery UI: header buttons next to Reset for the active non-terminal job.
- * Visibility rules live in nextHeaderJobVisibility (thinking-ui.mjs) — unit-tested.
- * @param {string|null|undefined} jobId
- * @param {string|null|undefined} jobStatus
+ * Header no longer hosts job recovery buttons (jobs live in Menu).
+ * Keep stubs so call sites stay simple / no-op.
  */
-function syncHeaderJobActions(jobId, jobStatus) {
-  if (!headerJobActions) return;
-  const next = nextHeaderJobVisibility(headerActiveJobId, jobId, jobStatus);
-  headerActiveJobId = next.activeJobId;
-  if (next.visible && next.activeJobId) {
-    headerJobActions.classList.remove("hidden");
-    headerJobActions.dataset.jobId = next.activeJobId;
-  } else {
-    headerJobActions.classList.add("hidden");
-    headerJobActions.dataset.jobId = "";
-  }
+function syncHeaderJobActions(_jobId, _jobStatus) {
+  /* no-op */
 }
 
-/** Force-hide header recovery (Reset, full clear). */
 function clearHeaderJobActions() {
-  syncHeaderJobActions(null, "cancelled");
+  /* no-op */
 }
 
-/** @deprecated name kept for call sites — routes to header controls */
-function syncJobActions(msgEl, jobId, jobStatus) {
-  syncHeaderJobActions(jobId, jobStatus);
-  // Ensure legacy per-message action rows stay hidden if any remain in DOM
+/** Hide any legacy per-message job-actions rows if present. */
+function syncJobActions(msgEl, _jobId, _jobStatus) {
   if (msgEl) {
     const legacy = msgEl.querySelector(".job-actions");
     if (legacy) {
@@ -640,143 +628,6 @@ function syncJobActions(msgEl, jobId, jobStatus) {
       legacy.innerHTML = "";
     }
   }
-}
-
-function setHeaderJobButtonsDisabled(disabled) {
-  if (headerGetResult) headerGetResult.disabled = !!disabled;
-  if (headerStopShow) headerStopShow.disabled = !!disabled;
-}
-
-async function pullJobResult(jobId, msgEl) {
-  const secret = getSecret();
-  if (!secret) return;
-  msgEl = msgEl || findBotMsgEl(jobId);
-  const bodyEl = msgEl?.querySelector(".body");
-  const thinkingEl = msgEl?.querySelector(".thinking");
-  setHeaderJobButtonsDisabled(true);
-  try {
-    const res = await fetch(`/api/jobs/${jobId}`, {
-      headers: { Authorization: `Bearer ${secret}` },
-      cache: "no-store",
-    });
-    const job = await res.json().catch(() => ({}));
-    if (!res.ok) throw new Error(job.error || res.statusText);
-
-    // Reuse the same UI path as SSE/poll
-    const toolsLine = job.tools?.length
-      ? job.tools.map((t) => `${t.name} (${t.status})`).join(" · ")
-      : "";
-    if (bodyEl) {
-      if (job.reply) setBodyContent(bodyEl, job.reply, "bot");
-      else if (job.error) setBodyContent(bodyEl, `Error: ${job.error}`, "bot");
-    }
-
-    const imageUrls = Array.isArray(job.images)
-      ? job.images.map((im) => im.path || im.url).filter(Boolean)
-      : [];
-    if (imageUrls.length && msgEl) setReplyImages(msgEl, imageUrls);
-
-    updateHistoryByJobId(jobId, {
-      text: job.reply || (job.error ? `Error: ${job.error}` : "") || "",
-      tools: toolsLine || undefined,
-      jobStatus: job.status,
-      images: imageUrls.length ? imageUrls : undefined,
-    });
-
-    if (isTerminalJobStatus(job.status)) {
-      setThinking(thinkingEl, { hide: true });
-      syncHeaderJobActions(jobId, job.status);
-      stopJobPoll(jobId);
-      if (bodyEl && !(job.reply || "").trim() && !job.error) {
-        setBodyContent(
-          bodyEl,
-          "_(Still no reply on the Mac. Try Stop & show, or send again.)_",
-          "bot"
-        );
-      }
-    } else {
-      setThinking(thinkingEl, {
-        phase: "Pulled latest — still running on Mac…",
-        tools: toolsLine,
-        thought: job.thought || "",
-        jobId,
-      });
-      syncHeaderJobActions(jobId, job.status);
-      // Ensure watcher is alive
-      if (!activePolls.has(jobId) && bodyEl && thinkingEl) {
-        startJobPoll(jobId, bodyEl, thinkingEl);
-      }
-    }
-    setConn("connected", "ok");
-    scrollBottom();
-  } catch (e) {
-    alert(`Could not pull result: ${e.message || e}`);
-  } finally {
-    setHeaderJobButtonsDisabled(false);
-  }
-}
-
-async function stopAndShowJob(jobId, msgEl) {
-  const secret = getSecret();
-  if (!secret) return;
-  if (
-    !confirm(
-      "Stop this job on the Mac and show whatever it has so far?\n\nThis frees the queue for new messages."
-    )
-  ) {
-    return;
-  }
-  msgEl = msgEl || findBotMsgEl(jobId);
-  const bodyEl = msgEl?.querySelector(".body");
-  const thinkingEl = msgEl?.querySelector(".thinking");
-  setHeaderJobButtonsDisabled(true);
-  try {
-    const res = await fetch(`/api/jobs/${jobId}/finalize`, {
-      method: "POST",
-      headers: { Authorization: `Bearer ${secret}` },
-    });
-    const job = await res.json().catch(() => ({}));
-    if (!res.ok) throw new Error(job.error || res.statusText);
-
-    setThinking(thinkingEl, { hide: true });
-    if (bodyEl) {
-      if (job.reply) setBodyContent(bodyEl, job.reply, "bot");
-      else setBodyContent(bodyEl, "_(Stopped — no reply yet.)_", "bot");
-    }
-
-    const imageUrls = Array.isArray(job.images)
-      ? job.images.map((im) => im.path || im.url).filter(Boolean)
-      : [];
-    if (imageUrls.length && msgEl) setReplyImages(msgEl, imageUrls);
-
-    updateHistoryByJobId(jobId, {
-      text: job.reply || "",
-      jobStatus: job.status,
-      images: imageUrls.length ? imageUrls : undefined,
-    });
-    syncHeaderJobActions(jobId, job.status);
-    stopJobPoll(jobId);
-    setConn("connected", "ok");
-    scrollBottom();
-  } catch (e) {
-    alert(`Stop failed: ${e.message || e}`);
-  } finally {
-    setHeaderJobButtonsDisabled(false);
-  }
-}
-
-// Header recovery buttons (primary placement next to Reset)
-if (headerGetResult) {
-  headerGetResult.onclick = () => {
-    const id = headerActiveJobId || headerJobActions?.dataset?.jobId;
-    if (id) void pullJobResult(id);
-  };
-}
-if (headerStopShow) {
-  headerStopShow.onclick = () => {
-    const id = headerActiveJobId || headerJobActions?.dataset?.jobId;
-    if (id) void stopAndShowJob(id);
-  };
 }
 
 function updateHistoryByJobId(jobId, patch) {
@@ -919,7 +770,7 @@ function startJobPoll(jobId, bodyEl, thinkingEl) {
     if (!(job.reply || "").trim() && !job.error) {
       setBodyContent(
         bodyEl,
-        "_(No reply text received. Tap Get result in the header, or send again.)_",
+        "_(No reply text received. Open Menu → Jobs, or send again.)_",
         "bot"
       );
     }
@@ -1024,7 +875,7 @@ function startJobPoll(jobId, bodyEl, thinkingEl) {
           text: "Job expired or missing on Mac.",
           jobStatus: "error",
         });
-        // Hide Get result / Stop & show — job is gone on the Mac
+        // Job is gone on the Mac
         syncHeaderJobActions(jobId, "error");
         return;
       }
@@ -1253,6 +1104,7 @@ function openActivityMenu() {
   activityDrawer.classList.remove("hidden");
   activityDrawer.setAttribute("aria-hidden", "false");
   if (menuBtn) menuBtn.setAttribute("aria-expanded", "true");
+  syncVoiceTriggerForm({ clearStatus: true });
   void refreshActivity({ force: true });
 }
 
@@ -1697,6 +1549,17 @@ if (activityClose) activityClose.onclick = () => closeActivityMenu();
 if (activityBackdrop) activityBackdrop.onclick = () => closeActivityMenu();
 if (activitySpawn) activitySpawn.onclick = () => void spawnAgentFromMenu();
 if (activityRefresh) activityRefresh.onclick = () => void refreshActivity({ force: true });
+if (voiceTriggerSave) voiceTriggerSave.onclick = () => saveVoiceTriggerFromForm();
+if (voiceTriggerReset) voiceTriggerReset.onclick = () => resetVoiceTriggerForm();
+if (voiceTriggerInput) {
+  voiceTriggerInput.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      saveVoiceTriggerFromForm();
+      voiceTriggerInput.blur();
+    }
+  });
+}
 if (agentChip) agentChip.onclick = () => {
   if (knownAgents.length > 1) cycleSendTarget();
   else openActivityMenu();
@@ -1960,6 +1823,162 @@ function applyDictationToInput(interim = "") {
   }
 }
 
+/** Spoken send triggers (localStorage override: JSON string array). */
+function getSendTriggers() {
+  try {
+    const raw = localStorage.getItem(SEND_TRIGGER_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed) && parsed.length) {
+        const list = parsed.map(String).filter(Boolean);
+        if (list.length) return list;
+      }
+      // Plain string from older hand-edits
+      if (typeof parsed === "string" && parsed.trim()) {
+        return parseSendTriggerInput(parsed);
+      }
+    }
+  } catch {
+    /* ignore */
+  }
+  return [...DEFAULT_SEND_TRIGGERS];
+}
+
+/** First phrase — used in listening hints. */
+function getPrimarySendPhrase() {
+  return primarySendTrigger(getSendTriggers());
+}
+
+/**
+ * Persist send phrases on this device.
+ * @param {string[]} triggers
+ * @returns {string[]}
+ */
+function setSendTriggers(triggers) {
+  const list = parseSendTriggerInput(
+    Array.isArray(triggers) ? triggers.join(", ") : String(triggers || "")
+  );
+  try {
+    localStorage.setItem(SEND_TRIGGER_KEY, JSON.stringify(list));
+  } catch {
+    /* ignore quota */
+  }
+  return list;
+}
+
+function clearSendTriggersToDefault() {
+  try {
+    localStorage.removeItem(SEND_TRIGGER_KEY);
+  } catch {
+    /* ignore */
+  }
+  return [...DEFAULT_SEND_TRIGGERS];
+}
+
+/**
+ * @param {{ clearStatus?: boolean }} [opts]
+ */
+function syncVoiceTriggerForm(opts = {}) {
+  if (!voiceTriggerInput) return;
+  voiceTriggerInput.value = formatSendTriggersForInput(getSendTriggers());
+  if (opts.clearStatus && voiceTriggerStatus) {
+    voiceTriggerStatus.textContent = "";
+    voiceTriggerStatus.classList.remove("is-error");
+  }
+}
+
+/**
+ * @param {string} msg
+ * @param {boolean} [isError]
+ */
+function setVoiceTriggerStatus(msg, isError = false) {
+  if (!voiceTriggerStatus) return;
+  voiceTriggerStatus.textContent = msg || "";
+  voiceTriggerStatus.classList.toggle("is-error", Boolean(isError && msg));
+}
+
+function saveVoiceTriggerFromForm() {
+  if (!voiceTriggerInput) return;
+  const list = setSendTriggers(voiceTriggerInput.value);
+  voiceTriggerInput.value = formatSendTriggersForInput(list);
+  const primary = primarySendTrigger(list);
+  setVoiceTriggerStatus(`Saved — say “${primary}” to send`);
+}
+
+function resetVoiceTriggerForm() {
+  const list = clearSendTriggersToDefault();
+  if (voiceTriggerInput) {
+    voiceTriggerInput.value = formatSendTriggersForInput(list);
+  }
+  setVoiceTriggerStatus(`Default — “${primarySendTrigger(list)}”`);
+}
+
+/**
+ * If finalized speech ends with a send trigger, strip it and auto-send.
+ * Only uses finals (not pure interim) to avoid sending on half-heard "send…".
+ * @param {boolean} [allowInterim=false]
+ */
+function maybeAutoSendFromSpeech(allowInterim = false) {
+  if (autoSendInFlight || !input) return false;
+  const finalsText = mergeDictationText(dictationBase, dictationFinals, "");
+  let hit = matchSendTrigger(finalsText, getSendTriggers());
+  if (!hit?.autoSend && allowInterim) {
+    const full = mergeDictationText(dictationBase, dictationFinals, "");
+    // also check current input (includes interim after apply)
+    hit = matchSendTrigger(input.value, getSendTriggers());
+    // Prefer not interim-only unless finals empty and full ends with trigger
+    if (hit?.autoSend && !finalsText.trim()) {
+      // wait for finalization
+      return false;
+    }
+  }
+  if (!hit?.autoSend) return false;
+  void autoSendFromDictation(hit.message, hit.trigger);
+  return true;
+}
+
+/**
+ * Stop listening, put cleaned text in the box, send.
+ * @param {string} message
+ * @param {string} [trigger]
+ */
+async function autoSendFromDictation(message, trigger) {
+  if (autoSendInFlight) return;
+  const text = String(message || "").trim();
+  if (!text) {
+    setDictationHint(
+      trigger
+        ? `Heard “${trigger}” but nothing to send.`
+        : "Nothing to send."
+    );
+    return;
+  }
+  autoSendInFlight = true;
+  try {
+    dictationWantListening = false;
+    clearDictationRestart();
+    stopDictation({ keepHint: true });
+    if (input) {
+      input.value = text;
+      resizeComposerInput();
+      clearDictationDraftUi();
+    }
+    setDictationHint(
+      trigger ? `Sending (heard “${trigger}”)…` : "Sending…",
+      true
+    );
+    await send();
+    setDictationHint("Sent.");
+    setTimeout(() => {
+      if (!dictationActive) setDictationHint("");
+    }, 1500);
+  } catch (e) {
+    setDictationHint(e?.message ? `Send failed: ${e.message}` : "Send failed.");
+  } finally {
+    autoSendInFlight = false;
+  }
+}
+
 /**
  * Put transcribed words into the composer as a draft — never auto-sends.
  * Highlights the new text so you can review/edit before tapping ↑.
@@ -2134,11 +2153,16 @@ async function uploadDictationBlob(blob) {
       setDictationHint("Heard nothing — try again a bit louder.");
       return;
     }
-    // Always land in the composer as a draft — you send manually with ↑
+    // Land in composer; auto-send if transcript ends with a send trigger
     appendTranscriptToInput(text);
-    setDictationHint(
-      "Draft in the box — review/edit, then tap ↑ to send. Mic again to add more."
-    );
+    const hit = matchSendTrigger(input?.value || "", getSendTriggers());
+    if (hit?.autoSend) {
+      void autoSendFromDictation(hit.message, hit.trigger);
+    } else {
+      setDictationHint(
+        `Draft ready — tap ↑, or next time say “${getPrimarySendPhrase()}” while dictating.`
+      );
+    }
   } catch (e) {
     setDictationHint(
       e?.message
@@ -2305,7 +2329,10 @@ function createSpeechRecognition() {
 
   rec.onstart = () => {
     setMicUi(true);
-    setDictationHint("Listening… tap mic when done.", true);
+    setDictationHint(
+      `Listening… say “${getPrimarySendPhrase()}” to send, or tap mic to stop.`,
+      true
+    );
   };
 
   rec.onresult = (ev) => {
@@ -2315,6 +2342,8 @@ function createSpeechRecognition() {
     dictationFinals = finals;
     dictationResultIndex = finals.length;
     applyDictationToInput(interim);
+    // Auto-send only when trigger is in finalized speech (stable)
+    maybeAutoSendFromSpeech(false);
   };
 
   rec.onerror = (ev) => {
@@ -2337,6 +2366,8 @@ function createSpeechRecognition() {
 
   rec.onend = () => {
     promoteDictationBaseFromInput();
+    // Catch trigger that landed on last final of the segment
+    if (maybeAutoSendFromSpeech(false)) return;
     if (!dictationWantListening) {
       setMicUi(false);
       return;
@@ -2374,7 +2405,10 @@ function beginBrowserRecognitionSession() {
   try {
     speechRec.start();
     setMicUi(true);
-    setDictationHint("Listening… speak now. Tap mic to stop.", true);
+    setDictationHint(
+      `Listening… speak now. Say “${getPrimarySendPhrase()}” to send, or tap mic to stop.`,
+      true
+    );
   } catch (e) {
     if (e?.name === "InvalidStateError" && dictationWantListening) {
       setMicUi(true);
@@ -2408,7 +2442,10 @@ async function startBrowserDictation() {
   dictationWantListening = true;
   dictationMode = "browser";
   setMicUi(true);
-  setDictationHint("Listening… speak now. Words appear live.", true);
+  setDictationHint(
+    `Listening… words appear live. Say “${getPrimarySendPhrase()}” to send.`,
+    true
+  );
   beginBrowserRecognitionSession();
 }
 
@@ -2924,7 +2961,8 @@ async function send() {
   }
 
   // Stop mic so we don't keep appending after send
-  if (dictationActive || dictationWantListening || mediaRecorder) {
+  if (dictationActive || dictationWantListening || mediaRecorder || speechRec) {
+    dictationWantListening = false;
     stopDictation();
   }
 

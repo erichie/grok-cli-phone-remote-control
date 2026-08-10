@@ -13,7 +13,7 @@
     <meta name="application-name" content="Grok" />
     <link rel="manifest" href="/manifest.webmanifest" />
     <link rel="apple-touch-icon" href="/icon-192.png" />
-    <link rel="stylesheet" href="/styles.css?v=45" />
+    <link rel="stylesheet" href="/styles.css?v=50" />
     <title>Grok</title>
     <script src="/marked.min.js"></script>
     <script src="/purify.min.js"></script>
@@ -36,26 +36,19 @@
           <span id="menu-badge" class="menu-badge hidden" aria-hidden="true">0</span>
         </button>
         <h1>Grok</h1>
-      </div>
-      <div class="header-right">
-        <div id="header-job-actions" class="header-job-actions hidden" aria-label="Job recovery">
+        <div id="agent-chip-bar" class="agent-chip-bar hidden" aria-label="Send target">
+          <span class="agent-chip-label">To</span>
           <button
             type="button"
-            id="header-get-result"
-            class="header-btn"
-            title="Pull the latest status/reply from the Mac"
+            id="agent-chip"
+            class="agent-chip"
+            title="Current agent session — tap to cycle, or open menu"
           >
-            Get result
-          </button>
-          <button
-            type="button"
-            id="header-stop-show"
-            class="header-btn header-btn-stop"
-            title="Stop the job and show whatever the Mac has so far"
-          >
-            Stop &amp; show
+            Main
           </button>
         </div>
+      </div>
+      <div class="header-right">
         <button type="button" id="reset-btn" class="header-btn" title="Reset agent if stuck">
           Reset
         </button>
@@ -84,12 +77,6 @@
     </section>
 
     <section id="chat">
-      <div id="agent-chip-bar" class="agent-chip-bar hidden" aria-label="Send target">
-        <span class="agent-chip-label">To</span>
-        <button type="button" id="agent-chip" class="agent-chip" title="Current agent session — tap to cycle, or open menu">
-          Main
-        </button>
-      </div>
       <div id="messages-wrap">
         <div id="messages"></div>
         <button
@@ -206,6 +193,43 @@
             </div>
             <div id="activity-jobs" class="activity-list"></div>
           </section>
+          <section class="activity-section" aria-labelledby="activity-voice-title">
+            <div class="activity-section-head">
+              <h3 id="activity-voice-title">Voice send</h3>
+              <button
+                type="button"
+                id="voice-trigger-reset"
+                class="activity-link-btn"
+                title="Restore default phrases"
+              >
+                Default
+              </button>
+            </div>
+            <p class="activity-hint">
+              While dictating, say this phrase at the end to send. Comma-separate aliases (STT mishears).
+              Saved on this phone only.
+            </p>
+            <label class="voice-trigger-label" for="voice-trigger-input">
+              Phrase(s)
+            </label>
+            <input
+              id="voice-trigger-input"
+              class="voice-trigger-input"
+              type="text"
+              autocomplete="off"
+              autocorrect="off"
+              spellcheck="false"
+              enterkeyhint="done"
+              placeholder="bee boop, beep boop"
+              aria-describedby="voice-trigger-status"
+            />
+            <div class="voice-trigger-actions">
+              <button type="button" id="voice-trigger-save" class="voice-trigger-save">
+                Save phrase
+              </button>
+              <span id="voice-trigger-status" class="voice-trigger-status" aria-live="polite"></span>
+            </div>
+          </section>
         </div>
       </aside>
     </div>
@@ -226,6 +250,6 @@
       </div>
     </div>
 
-    <script type="module" src="/app.js?v=45"></script>
+    <script type="module" src="/app.js?v=50"></script>
   </body>
 </html>

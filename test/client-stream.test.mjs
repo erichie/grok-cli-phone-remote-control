@@ -36,33 +36,23 @@ test("server exposes SSE stream endpoint and notifies on persist", () => {
   assert.match(serverJs, /TerminalManager/);
 });
 
-test("Get result / Stop & show live in header next to Reset", () => {
+test("header hosts agent chip; job recovery is in Menu not top bar", () => {
   const html = readFileSync(join(root, "public/index.html"), "utf8");
-  // Header placement (not only under message bubbles)
-  assert.match(html, /id="header-job-actions"/);
-  assert.match(html, /id="header-get-result"/);
-  assert.match(html, /id="header-stop-show"/);
+  // No Get result / Stop & show in the header
+  assert.doesNotMatch(html, /id="header-job-actions"/);
+  assert.doesNotMatch(html, /id="header-get-result"/);
+  assert.doesNotMatch(html, /id="header-stop-show"/);
   assert.match(html, /id="reset-btn"/);
-  // Get result appears before Reset in header-right block
-  const hr = html.indexOf("header-job-actions");
-  const reset = html.indexOf("reset-btn");
-  assert.ok(hr >= 0 && reset > hr, "header job actions should sit near Reset");
-  assert.match(appJs, /syncHeaderJobActions/);
-  assert.match(appJs, /nextHeaderJobVisibility/);
-  assert.match(appJs, /headerGetResult|header-get-result/);
+  // Agent chip lives in the top bar (inside <header>)
+  const headerEnd = html.indexOf("</header>");
+  const chip = html.indexOf('id="agent-chip-bar"');
+  assert.ok(chip >= 0 && chip < headerEnd, "agent chip should be inside header");
+  assert.match(html, /id="agent-chip"/);
+  // Stop & show remains available from Menu job cards
+  assert.match(appJs, /Stop & show|finalizeJobFromMenu/);
   assert.match(appJs, /\/finalize/);
-  // Per-message job-actions are no longer the primary wire path
-  assert.match(appJs, /Primary recovery UI: header|header-job-actions|syncHeaderJobActions/);
-  // Reset and job-404 must clear header recovery (stuck-button bugs)
-  assert.match(appJs, /clearHeaderJobActions/);
-  assert.match(
-    appJs,
-    /res\.status === 404[\s\S]{0,400}syncHeaderJobActions\(jobId,\s*["']error["']\)/
-  );
-  assert.match(
-    appJs,
-    /clearHeaderJobActions\(\)|function resetAgent[\s\S]{0,800}clearHeaderJobActions/
-  );
+  // Per-message job-actions stay non-primary
+  assert.match(appJs, /syncJobActions|job-actions/);
 });
 
 test("thinking UI uses shared breathing/dots markup builder", () => {

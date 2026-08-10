@@ -337,6 +337,116 @@ export function liveSpeechComposerText(base, sessionFinals, interim = "") {
   return mergeDictationText(base, sessionFinals, interim);
 }
 
+/** Default spoken phrases that mean “send the draft now”. Longest match wins. */
+export const DEFAULT_SEND_TRIGGERS = [
+  "bee boop",
+  "beep boop",
+  "b boop",
+];
+
+/**
+ * Parse a user-edited send-phrase field (comma / newline separated).
+ * Empty → defaults. Duplicates removed; order preserved (first = primary).
+ *
+ * @param {string} raw
+ * @returns {string[]}
+ */
+export function parseSendTriggerInput(raw) {
+  const parts = String(raw || "")
+    .split(/[\n,;]+/)
+    .map((p) => p.replace(/\s+/g, " ").trim())
+    .filter(Boolean);
+  if (!parts.length) return [...DEFAULT_SEND_TRIGGERS];
+  const seen = new Set();
+  const out = [];
+  for (const p of parts) {
+    const key = normalizeSpeechForTrigger(p);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    out.push(p);
+  }
+  return out.length ? out : [...DEFAULT_SEND_TRIGGERS];
+}
+
+/**
+ * Display string for the settings field.
+ * @param {string[]} triggers
+ * @returns {string}
+ */
+export function formatSendTriggersForInput(triggers) {
+  const list =
+    Array.isArray(triggers) && triggers.length
+      ? triggers.map(String).filter(Boolean)
+      : DEFAULT_SEND_TRIGGERS;
+  return list.join(", ");
+}
+
+/**
+ * Primary phrase for UI hints (first configured trigger).
+ * @param {string[]} [triggers]
+ * @returns {string}
+ */
+export function primarySendTrigger(triggers = DEFAULT_SEND_TRIGGERS) {
+  const list =
+    Array.isArray(triggers) && triggers.length
+      ? triggers.map(String).filter(Boolean)
+      : DEFAULT_SEND_TRIGGERS;
+  return list[0] || DEFAULT_SEND_TRIGGERS[0];
+}
+
+/**
+ * @param {string} text
+ * @returns {string}
+ */
+export function normalizeSpeechForTrigger(text) {
+  return String(text || "")
+    .toLowerCase()
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^\p{L}\p{N}\s]/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/**
+ * If `text` ends with a send-trigger phrase, return message with trigger removed.
+ * Only matches at the end (avoids mid-sentence "please send it over").
+ *
+ * @param {string} text
+ * @param {string[]} [triggers]
+ * @returns {{ message: string, trigger: string, autoSend: boolean } | null}
+ */
+export function matchSendTrigger(text, triggers = DEFAULT_SEND_TRIGGERS) {
+  const raw = String(text || "").replace(/\s+/g, " ").trim();
+  if (!raw) return null;
+  const norm = normalizeSpeechForTrigger(raw);
+  if (!norm) return null;
+
+  const sorted = [...(triggers || DEFAULT_SEND_TRIGGERS)]
+    .map((t) => normalizeSpeechForTrigger(t))
+    .filter(Boolean)
+    .sort((a, b) => b.length - a.length);
+
+  for (const trig of sorted) {
+    if (norm === trig) {
+      return { message: "", trigger: trig, autoSend: false };
+    }
+    // Only at end of utterance (space + trigger)
+    if (!norm.endsWith(" " + trig)) continue;
+    const trigWords = trig.split(/\s+/).filter(Boolean).length;
+    const words = raw.split(/\s+/).filter(Boolean);
+    const message = words
+      .slice(0, Math.max(0, words.length - trigWords))
+      .join(" ")
+      .trim();
+    if (!message) {
+      return { message: "", trigger: trig, autoSend: false };
+    }
+    return { message, trigger: trig, autoSend: true };
+  }
+  return null;
+}
+
 /**
  * Human-readable error for SpeechRecognition error codes.
  * @param {string} code

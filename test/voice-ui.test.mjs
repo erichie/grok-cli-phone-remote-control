@@ -26,6 +26,11 @@ import {
   selectDictationPath,
   buildComposerDraft,
   buildFreeHttpsMicUrl,
+  matchSendTrigger,
+  DEFAULT_SEND_TRIGGERS,
+  parseSendTriggerInput,
+  formatSendTriggersForInput,
+  primarySendTrigger,
 } from "../public/voice-ui.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -277,6 +282,70 @@ test("buildComposerDraft merges transcript for review-before-send", () => {
   assert.equal(buildComposerDraft("Hi  ", "there"), "Hi there");
   assert.equal(buildComposerDraft("keep", ""), "keep");
   assert.equal(buildComposerDraft("a", "b c"), "a b c");
+});
+
+test("matchSendTrigger strips trailing bee boop", () => {
+  const hit = matchSendTrigger(
+    "Please refactor the login flow bee boop",
+    DEFAULT_SEND_TRIGGERS
+  );
+  assert.ok(hit);
+  assert.equal(hit.autoSend, true);
+  assert.equal(hit.message, "Please refactor the login flow");
+  assert.match(hit.trigger, /bee boop/);
+});
+
+test("matchSendTrigger accepts beep boop variant", () => {
+  const hit = matchSendTrigger("ship it beep boop", DEFAULT_SEND_TRIGGERS);
+  assert.ok(hit?.autoSend);
+  assert.equal(hit.message, "ship it");
+});
+
+test("matchSendTrigger does not fire mid-sentence", () => {
+  assert.equal(
+    matchSendTrigger("the bee boop sound is funny though", DEFAULT_SEND_TRIGGERS),
+    null
+  );
+});
+
+test("matchSendTrigger alone does not send empty", () => {
+  const hit = matchSendTrigger("bee boop", DEFAULT_SEND_TRIGGERS);
+  assert.ok(hit);
+  assert.equal(hit.autoSend, false);
+  assert.equal(hit.message, "");
+});
+
+test("parseSendTriggerInput splits commas and dedupes", () => {
+  const list = parseSendTriggerInput("  send it , SEND IT,  go go  ");
+  assert.deepEqual(list, ["send it", "go go"]);
+});
+
+test("parseSendTriggerInput empty falls back to defaults", () => {
+  assert.deepEqual(parseSendTriggerInput("  ,  "), DEFAULT_SEND_TRIGGERS);
+  assert.deepEqual(parseSendTriggerInput(""), DEFAULT_SEND_TRIGGERS);
+});
+
+test("format and primary helpers", () => {
+  assert.equal(primarySendTrigger(["zap", "ping"]), "zap");
+  assert.equal(
+    formatSendTriggersForInput(["bee boop", "beep boop"]),
+    "bee boop, beep boop"
+  );
+  assert.equal(
+    primarySendTrigger([]),
+    DEFAULT_SEND_TRIGGERS[0]
+  );
+});
+
+test("custom triggers work with matchSendTrigger", () => {
+  const triggers = parseSendTriggerInput("send it now, ship");
+  const hit = matchSendTrigger("refactor auth send it now", triggers);
+  assert.ok(hit?.autoSend);
+  assert.equal(hit.message, "refactor auth");
+  assert.equal(
+    matchSendTrigger("please ship", triggers)?.message,
+    "please"
+  );
 });
 
 test("desktop with Web Speech does not force server path", () => {
