@@ -82,24 +82,17 @@ test("transcript inject includes prior turns for cold ACP session", () => {
 test("startFreshConversation + rebuild ignores pre-clear jobs", async () => {
   const dir = await mkdtemp(join(tmpdir(), "phone-clear-"));
   try {
+    // Relative times — hard-coded calendar dates go stale as wall clock moves on
+    const t = Date.now();
     const oldJob = {
       id: "old-usage",
       status: "done",
       text: "/usage",
       reply: "## Usage old",
-      createdAt: "2026-08-06T12:00:00.000Z",
-      updatedAt: "2026-08-06T12:00:01.000Z",
-    };
-    const newJob = {
-      id: "new-hi",
-      status: "done",
-      text: "Hi after clear",
-      reply: "Hello",
-      createdAt: "2026-08-07T20:00:00.000Z",
-      updatedAt: "2026-08-07T20:00:01.000Z",
+      createdAt: new Date(t - 120_000).toISOString(),
+      updatedAt: new Date(t - 119_000).toISOString(),
     };
     await writeFile(join(dir, "old.json"), JSON.stringify(oldJob));
-    await writeFile(join(dir, "new.json"), JSON.stringify(newJob));
 
     let state = emptyConversation();
     state = await rebuildConversationFromJobs(dir, state);
@@ -112,7 +105,19 @@ test("startFreshConversation + rebuild ignores pre-clear jobs", async () => {
     assert.equal(state.turns.length, 0);
     assert.ok(state.clearedAt);
     assert.equal(jobIsAfterClear(oldJob, state.clearedAt), false);
+
+    // Job that exists only after clear (timestamps strictly after clearedAt)
+    const cut = Date.parse(state.clearedAt);
+    const newJob = {
+      id: "new-hi",
+      status: "done",
+      text: "Hi after clear",
+      reply: "Hello",
+      createdAt: new Date(cut + 1_000).toISOString(),
+      updatedAt: new Date(cut + 2_000).toISOString(),
+    };
     assert.equal(jobIsAfterClear(newJob, state.clearedAt), true);
+    await writeFile(join(dir, "new.json"), JSON.stringify(newJob));
 
     // Simulate open after clear: rebuild must not re-append old jobs
     state = await rebuildConversationFromJobs(dir, state);
