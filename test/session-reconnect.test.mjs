@@ -18,6 +18,8 @@ import {
   restoreAfterRestart,
   startFreshConversation,
   jobIsAfterClear,
+  isMainAgentId,
+  jobBelongsToMainConversation,
 } from "../lib/conversation.mjs";
 
 test("session reconnect: prior assistant text survives restart seam", async () => {
@@ -154,6 +156,79 @@ test("rebuildConversationFromJobs recovers text from job files only", async () =
     assert.ok(msgs.some((m) => m.role === "user" && /Hello/.test(m.text)));
     assert.ok(
       msgs.some((m) => m.role === "bot" && /World from durable job/.test(m.text))
+    );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("isMainAgentId treats missing/default/auto as main", () => {
+  assert.equal(isMainAgentId(undefined), true);
+  assert.equal(isMainAgentId("main"), true);
+  assert.equal(isMainAgentId("default"), true);
+  assert.equal(isMainAgentId("auto"), true);
+  assert.equal(isMainAgentId("bf0e936b-3267-4edd-9396-d6878fadb482"), false);
+  assert.equal(
+    jobBelongsToMainConversation({ agentId: "other-agent" }),
+    false
+  );
+  assert.equal(jobBelongsToMainConversation({}), true);
+});
+
+test("rebuildConversationFromJobs ignores extra-agent jobs and heals leaks", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "phone-agent-iso-"));
+  try {
+    await writeFile(
+      join(dir, "main.json"),
+      JSON.stringify({
+        id: "main-job",
+        status: "done",
+        text: "What about the desktop UX plan?",
+        reply: "The plan is written.",
+        createdAt: "2026-08-12T19:00:00.000Z",
+        updatedAt: "2026-08-12T19:00:10.000Z",
+        agentId: "main",
+      })
+    );
+    await writeFile(
+      join(dir, "extra.json"),
+      JSON.stringify({
+        id: "extra-job",
+        status: "done",
+        text: "Other agent: implement watermark",
+        reply: "Watermark is on disk.",
+        createdAt: "2026-08-12T19:01:00.000Z",
+        updatedAt: "2026-08-12T19:01:10.000Z",
+        agentId: "bf0e936b-3267-4edd-9396-d6878fadb482",
+      })
+    );
+
+    let state = emptyConversation();
+    upsertJobInConversation(state, {
+      id: "extra-job",
+      status: "done",
+      text: "Other agent: implement watermark",
+      reply: "Watermark is on disk.",
+      agentId: "bf0e936b-3267-4edd-9396-d6878fadb482",
+    });
+    assert.ok(
+      conversationToMessages(state).some((m) => /watermark/i.test(m.text)),
+      "precondition: leak present before rebuild"
+    );
+
+    state = await rebuildConversationFromJobs(dir, state);
+    const msgs = conversationToMessages(state);
+    assert.ok(
+      msgs.some((m) => /desktop UX/i.test(m.text)),
+      "main job stays"
+    );
+    assert.ok(
+      !msgs.some((m) => /watermark/i.test(m.text)),
+      "extra-agent job must not appear in main transcript"
+    );
+    assert.equal(
+      msgs.filter((m) => m.jobId === "extra-job").length,
+      0
     );
   } finally {
     await rm(dir, { recursive: true, force: true });

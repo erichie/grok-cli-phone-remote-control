@@ -40,6 +40,7 @@ import {
   applyPromptDone,
   forceTerminalizeJob,
   isTerminalJobStatus,
+  hasInFlightWork,
 } from "./lib/job-stream.mjs";
 import {
   isJobSealed,
@@ -52,6 +53,8 @@ import {
   loadConversation,
   saveConversation,
   upsertJobInConversation,
+  jobBelongsToMainConversation,
+  isMainAgentId,
   conversationToMessages,
   rebuildConversationFromJobs,
   buildTranscriptPromptContext,
@@ -100,13 +103,14 @@ const BILLING_MONTHLY_URL = "https://cli-chat-proxy.grok.com/v1/billing";
 const USER_SUB_URL =
   "https://cli-chat-proxy.grok.com/v1/user?include=subscription";
 /**
- * Progress silence: no *message/tool* chunks for this long → treat as hung and recover.
- * Thought-only streams do NOT reset the idle timer (high-effort reasoning can stream forever).
- * Absolute max wall time still applies. Override with PHONE_CHAT_JOB_IDLE_TIMEOUT_MS.
+ * Progress silence: no message / thought / tool / terminal activity for this
+ * long → treat as hung and recover. In-flight tools and live ACP terminals
+ * skip the idle kill (long builds are not hangs). Absolute max wall time still
+ * applies. Override with PHONE_CHAT_JOB_IDLE_TIMEOUT_MS.
  */
-/** No user-visible message/tool progress for this long → hang recovery (default 90s). */
+/** No stream/RPC activity for this long → hang recovery (default 5 min). */
 const JOB_IDLE_TIMEOUT_MS = Number(
-  process.env.PHONE_CHAT_JOB_IDLE_TIMEOUT_MS || 90 * 1000
+  process.env.PHONE_CHAT_JOB_IDLE_TIMEOUT_MS || 5 * 60 * 1000
 );
 /** Max JSON/body size for chat uploads (images base64 included). */
 const MAX_BODY_BYTES = Number(
@@ -378,6 +382,7 @@ class GrokAcp {
       allowedRoots: this.allowedRoots,
       writeMessage: (obj) => this._writeMessage(obj),
       onSessionUpdate: (update) => this.emit(update),
+      onActivity: () => this.emit({ sessionUpdate: "client_activity" }),
       onWarn: (msg) => console.warn(`[acp] ${msg}`),
     });
   }
@@ -657,6 +662,8 @@ async function persistConversation() {
 
 async function rememberJobInConversation(job) {
   if (!job?.id) return;
+  // Extra agents must not land in the main host transcript (phone main chat).
+  if (!jobBelongsToMainConversation(job)) return;
   upsertJobInConversation(conversation, job);
   // Durable transcript is shared; ACP session resume only applies to main.
   // Extra concurrent agents keep their own process-local sessionIds.
@@ -1414,6 +1421,11 @@ async function runAgentTurn(job, promptText, opts = {}) {
     if (now - turnStartMs >= maxMs) {
       killForTimeout("max");
     } else if (now - lastProgressMs >= idleMs) {
+      // Long-running tools (EAS, next build, emulator) go quiet on purpose.
+      // Killing them is what made phone sessions look like they "ended early."
+      if (hasInFlightWork(job, acp.terminals?.terminals)) {
+        return;
+      }
       killForTimeout("idle");
     }
   }, 2000);
@@ -1507,12 +1519,17 @@ async function runAgentTurn(job, promptText, opts = {}) {
  * @param {string} excludeId
  * @param {number} limit
  */
-async function loadRecentFinishedJobs(excludeId, limit = 4) {
+async function loadRecentFinishedJobs(excludeId, limit = 4, agentId = "main") {
   const out = [];
   const seen = new Set();
   const consider = (j) => {
     if (!j?.id || j.id === excludeId || seen.has(j.id)) return;
     if (!isTerminalJobStatus(j.status)) return;
+    if (isMainAgentId(agentId)) {
+      if (!jobBelongsToMainConversation(j)) return;
+    } else if (String(j.agentId || "main") !== String(agentId)) {
+      return;
+    }
     seen.add(j.id);
     out.push(j);
   };
@@ -1635,18 +1652,21 @@ async function runJob(job, acpInst) {
     !acp.sessionResumed || isShortFollowUp(job.text);
   if (needTranscript) {
     try {
-      const fromConv = buildTranscriptPromptContext(
-        conversation.turns,
-        job.id,
-        10
-      );
+      const jobIsMain = jobBelongsToMainConversation(job);
+      const fromConv = jobIsMain
+        ? buildTranscriptPromptContext(conversation.turns, job.id, 10)
+        : "";
       if (fromConv) {
         promptText = `${fromConv}\n\nUser's latest message: ${job.text.trim()}`;
         console.log(
           `[jobs] ${job.id} injected durable transcript (resumed=${!!acp.sessionResumed})`
         );
-      } else if (isShortFollowUp(job.text)) {
-        const recent = await loadRecentFinishedJobs(job.id, 3);
+      } else if (isShortFollowUp(job.text) || !jobIsMain) {
+        const recent = await loadRecentFinishedJobs(
+          job.id,
+          3,
+          job.agentId || "main"
+        );
         const ctx = buildRecentContextBlock(recent, job.id, 2);
         if (ctx) {
           promptText = `${ctx}\n\nUser's latest message: ${job.text.trim()}`;
@@ -1805,7 +1825,7 @@ async function runJob(job, acpInst) {
     const headlessReply = await runHeadlessPrompt(
       fallbackPrompt,
       CWD,
-      Math.min(JOB_MAX_TIMEOUT_MS, 4 * 60 * 1000)
+      Math.min(JOB_MAX_TIMEOUT_MS, 15 * 60 * 1000)
     );
     // Re-check after long await — user may have finalized mid-headless
     if (isJobSealed(job)) return;

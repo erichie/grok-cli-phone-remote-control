@@ -193,3 +193,20 @@ export function ensureActiveJobBotMessages(messages, activeJobs) {
   }
   return list;
 }
+
+/**
+ * After host merge, drop local turns whose jobId is not on the main
+ * host transcript (other agent sessions used to leak into main).
+ * @param {Array} messages
+ * @param {Array} hostMsgs
+ * @param {Array<{ id?: string }>} [mainJobs]
+ */
+export function dropForeignJobTurns(messages, hostMsgs, mainJobs = []) {
+  const host = Array.isArray(hostMsgs) ? hostMsgs : [];
+  if (!host.length) return Array.isArray(messages) ? messages.slice() : [];
+  const keep = new Set(host.map((m) => m.jobId).filter(Boolean));
+  for (const j of mainJobs || []) {
+    if (j?.id) keep.add(j.id);
+  }
+  return (messages || []).filter((m) => !m.jobId || keep.has(m.jobId));
+}

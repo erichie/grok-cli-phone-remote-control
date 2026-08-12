@@ -1,5 +1,6 @@
 import {
   mergeHostHistory,
+  dropForeignJobTurns,
   ensureActiveJobBotMessages,
 } from "./history-merge.mjs";
 import { buildThinkingHtml } from "./thinking-ui.mjs";
@@ -1689,6 +1690,10 @@ function applyHostConversation(host) {
   } else {
     history = loadHistory("main");
   }
+
+  // Host transcript is main-only. Drop leftover extra-agent turns that
+  // previously leaked into the main localStorage bucket.
+  history = dropForeignJobTurns(history, hostMsgs, agentJobs);
 
   history = ensureActiveJobBotMessages(history, agentJobs);
   if (hostId) setStoredConversationId(hostId, "main");

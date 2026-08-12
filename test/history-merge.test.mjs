@@ -8,6 +8,7 @@ import {
   historyEntryKey,
   mergeHostHistory,
   ensureActiveJobBotMessages,
+  dropForeignJobTurns,
 } from "../public/history-merge.mjs";
 
 test("historyEntryKey separates user and bot for same jobId", () => {
@@ -188,4 +189,20 @@ test("unlock rehydrate path: merge + ensure yields bot for poll reattach", () =>
       `missing bot for ${j.id}`
     );
   }
+});
+
+test("dropForeignJobTurns removes extra-agent jobs leaked into main history", () => {
+  const host = [
+    { role: "user", text: "Main question", jobId: "main-1" },
+    { role: "bot", text: "Main answer", jobId: "main-1" },
+  ];
+  const leaked = [
+    ...host,
+    { role: "user", text: "Other agent chat", jobId: "extra-9" },
+    { role: "bot", text: "Other agent reply", jobId: "extra-9" },
+  ];
+  const cleaned = dropForeignJobTurns(leaked, host, []);
+  assert.equal(cleaned.length, 2);
+  assert.ok(cleaned.every((m) => m.jobId === "main-1"));
+  assert.ok(!cleaned.some((m) => /Other agent/.test(m.text)));
 });

@@ -9,6 +9,7 @@ import {
   applyPromptDone,
   isTerminalJobStatus,
   forceTerminalizeJob,
+  hasInFlightWork,
 } from "../lib/job-stream.mjs";
 
 test("progressive ACP updates grow reply and tools before terminal", () => {
@@ -39,12 +40,12 @@ test("progressive ACP updates grow reply and tools before terminal", () => {
   assert.equal(job.reply, "I'll look into that.");
   assert.equal(isTerminalJobStatus(job.status), false);
 
-  // 2) thought (does not mark hang progress)
+  // 2) thought (counts as live progress — silence is the hang)
   r = applySessionUpdate(job, {
     sessionUpdate: "agent_thought_chunk",
     content: { type: "text", text: "planning shell command…" },
   });
-  assert.equal(r.progressed, false);
+  assert.equal(r.progressed, true);
   assert.match(job.thought, /planning/);
   snap("thought");
 
@@ -109,6 +110,31 @@ test("applySessionUpdate is the production-shaped ingest (message/tool kinds)", 
     content: { type: "text", text: "B" },
   });
   assert.equal(job.reply, "AB");
+});
+
+test("client_activity and in-flight tools count as live work", () => {
+  const job = createJob({ status: "running" });
+  assert.equal(hasInFlightWork(job, null), false);
+
+  applySessionUpdate(job, {
+    sessionUpdate: "tool_call",
+    title: "run_terminal_command",
+    status: "running",
+  });
+  assert.equal(hasInFlightWork(job, null), true);
+
+  applySessionUpdate(job, {
+    sessionUpdate: "tool_call_update",
+    title: "run_terminal_command",
+    status: "completed",
+  });
+  assert.equal(hasInFlightWork(job, null), false);
+
+  const terminals = new Map([["t1", {}]]);
+  assert.equal(hasInFlightWork(job, terminals), true);
+
+  const r = applySessionUpdate(job, { sessionUpdate: "client_activity" });
+  assert.equal(r.progressed, true);
 });
 
 test("forceTerminalize after partial stream never leaves running", () => {

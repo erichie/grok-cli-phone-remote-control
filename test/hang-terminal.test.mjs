@@ -41,7 +41,7 @@ test("hang watch detects idle after partial ack with no further progress", () =>
   });
   watch.markProgress();
 
-  // thought-only should NOT be used by caller to markProgress — simulate silence
+  // Simulate a caller that stops marking progress (true hang = silence)
   applySessionUpdate(job, {
     sessionUpdate: "agent_thought_chunk",
     content: { type: "text", text: "still thinking…" },

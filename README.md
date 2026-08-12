@@ -169,7 +169,7 @@ https://<mac-tailscale-ip>:8788
 | `PHONE_CHAT_CWD` | parent of this app directory | Working directory for the agent |
 | `GROK_BIN` | `grok` | Path to the Grok CLI binary |
 | `PHONE_CHAT_DEBUG` | unset | If set, log agent stderr |
-| `PHONE_CHAT_JOB_IDLE_TIMEOUT_MS` | `90000` (90s) | Kill hung agent turn after no message/tool progress (thoughts alone do not reset the timer) |
+| `PHONE_CHAT_JOB_IDLE_TIMEOUT_MS` | `300000` (5m) | Kill hung agent turn after no message/thought/tool/terminal activity. In-flight tools and live ACP shells skip this timer. |
 | `PHONE_CHAT_JOB_TIMEOUT_MS` | `2700000` (45m) | Absolute max wall time per job |
 | `PHONE_CHAT_JOB_AUTO_RETRIES` | `1` | Auto-retry once on agent crash / partial first line |
 | `PHONE_CHAT_MAX_BODY_BYTES` | `12582912` (~12MB) | Max request body size (chat + base64 images) |
