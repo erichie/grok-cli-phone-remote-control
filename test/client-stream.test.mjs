@@ -48,7 +48,7 @@ test("header hosts agent chip; job recovery is in Menu not top bar", () => {
   const chip = html.indexOf('id="agent-chip-bar"');
   assert.ok(chip >= 0 && chip < headerEnd, "agent chip should be inside header");
   assert.match(html, /id="agent-chip"/);
-  // Stop & show remains available from Menu job cards
+  // Stop & show remains available from the Jobs page
   assert.match(appJs, /Stop & show|finalizeJobFromMenu/);
   assert.match(appJs, /\/finalize/);
   // Per-message job-actions stay non-primary

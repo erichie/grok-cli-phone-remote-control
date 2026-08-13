@@ -173,6 +173,14 @@ test("isMainAgentId treats missing/default/auto as main", () => {
     false
   );
   assert.equal(jobBelongsToMainConversation({}), true);
+  assert.equal(
+    jobBelongsToMainConversation({ agentId: "main", loopId: "morning-brief" }),
+    false
+  );
+  assert.equal(
+    jobBelongsToMainConversation({ agentId: "main", source: "loop" }),
+    false
+  );
 });
 
 test("rebuildConversationFromJobs ignores extra-agent jobs and heals leaks", async () => {

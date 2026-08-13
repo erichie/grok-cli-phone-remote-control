@@ -72,6 +72,21 @@ import {
   normalizeDictationSuccess,
 } from "./lib/dictation.mjs";
 import { ensurePhoneTlsMaterial, listLanIPv4 } from "./lib/phone-tls.mjs";
+import { openStandup, getFeedPayload, readLocalStandupSeed } from "./lib/standup.mjs";
+import {
+  readLocalLoops,
+  readLoopState,
+  listLoops,
+  recordLoopRun,
+  isLoopDue,
+} from "./lib/loops.mjs";
+import { readAllBriefs, readBrief, upsertBrief } from "./lib/briefs.mjs";
+import {
+  parseLoopReport,
+  gatherSynthInputs,
+  buildSpecialistPrompt,
+  buildSynthPrompt,
+} from "./lib/loop-report.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PUBLIC = join(__dirname, "public");
@@ -95,6 +110,15 @@ const INBOX = join(homedir(), ".grok", "phone-inbox");
 const JOBS_DIR = join(homedir(), ".grok", "phone-jobs");
 /** Durable conversation transcript + last ACP session id (survives bridge restart). */
 const CONVERSATION_PATH = join(homedir(), ".grok", "phone-conversation.json");
+/** Daily standup feed (SQLite on Node 22+). */
+const STANDUP_PATH = join(homedir(), ".grok", "phone-standup.db");
+/** Host-only pins (north star, etc.). Not in the public repo. */
+const STANDUP_SEED_PATH = join(homedir(), ".grok", "phone-standup-seed.json");
+/** Host-only loop catalog. Copy examples/phone-loops.example.json here. */
+const LOOPS_PATH = join(homedir(), ".grok", "phone-loops.json");
+const LOOPS_STATE_PATH = join(homedir(), ".grok", "phone-loops-state.json");
+/** Latest specialist brief per loop. Host-only. */
+const BRIEFS_PATH = join(homedir(), ".grok", "phone-briefs.json");
 const AUTH_PATH = join(homedir(), ".grok", "auth.json");
 /** Live credit/usage (same source as TUI /usage). */
 const BILLING_CREDITS_URL =
@@ -121,6 +145,10 @@ const JOB_MAX_TIMEOUT_MS = Number(
 );
 /** Auto-retry once when the agent dies or returns only a partial first line. */
 const JOB_AUTO_RETRIES = Number(process.env.PHONE_CHAT_JOB_AUTO_RETRIES || 1);
+
+const standup = openStandup(STANDUP_PATH, {
+  seed: readLocalStandupSeed(STANDUP_SEED_PATH),
+});
 
 if (!SECRET) {
   console.error(
@@ -971,7 +999,11 @@ function publicJob(job) {
     tools: job.tools || [],
     error: job.error || null,
     agentId,
-    agentLabel: agentPub?.label || (agentId === "main" ? "Main" : agentId.slice(0, 8)),
+    agentLabel: job.loopName
+      ? job.loopName
+      : agentPub?.label || (agentId === "main" ? "Main" : agentId.slice(0, 8)),
+    loopId: job.loopId || null,
+    source: job.source || null,
     queuePosition:
       job.status === "queued"
         ? Math.max(0, slot.jobQueue.indexOf(job.id) + 1)
@@ -1649,7 +1681,9 @@ async function runJob(job, acpInst) {
   // Always inject for short follow-ups ("yes please") even if session was loaded —
   // load may not replay tool-side history the model needs for confirmations.
   const needTranscript =
-    !acp.sessionResumed || isShortFollowUp(job.text);
+    !job.loopId &&
+    job.source !== "loop" &&
+    (!acp.sessionResumed || isShortFollowUp(job.text));
   if (needTranscript) {
     try {
       const jobIsMain = jobBelongsToMainConversation(job);
@@ -2250,6 +2284,7 @@ async function handleJobsList(req, res) {
     processing: anyQueueRunning(),
     agents: registry.list(),
     maxAgents: registry.maxAgents,
+    standupUnread: standup.unreadCount(),
   });
 }
 
@@ -2283,6 +2318,7 @@ async function handleStatus(req, res) {
     liveMicHint: httpsListenInfo
       ? `For live in-page mic on iPhone, open https://<mac-ip>:${httpsListenInfo.port} once (trust the free cert), then re-add to Home Screen.`
       : null,
+    standupUnread: standup.unreadCount(),
   });
 }
 
@@ -2358,6 +2394,274 @@ async function stopAgentHard(agentId, opts = {}) {
     remove: !!opts.remove && !slot.isMain,
   });
   return out;
+}
+
+function handleStandupFeed(req, res) {
+  if (!authOk(req)) return sendJson(res, 401, { error: "unauthorized" });
+  const url = new URL(req.url || "/", `http://${req.headers.host}`);
+  const limit = Number(url.searchParams.get("limit") || 80);
+  sendJson(res, 200, getFeedPayload(standup, limit));
+}
+
+function handleStandupPostGet(req, res, id) {
+  if (!authOk(req)) return sendJson(res, 401, { error: "unauthorized" });
+  const post = standup.getPost(id);
+  if (!post) return sendJson(res, 404, { error: "not found" });
+  sendJson(res, 200, { post, pins: standup.getPins() });
+}
+
+async function handleStandupCreate(req, res) {
+  if (!authOk(req)) return sendJson(res, 401, { error: "unauthorized" });
+  let body = {};
+  try {
+    const raw = (await readBody(req)).toString("utf8");
+    if (raw.trim()) body = JSON.parse(raw);
+  } catch (e) {
+    if (e && e.code === "BODY_TOO_LARGE") {
+      return sendJson(res, 413, { error: e.message });
+    }
+    return sendJson(res, 400, { error: "invalid json" });
+  }
+  try {
+    const post = standup.createPost(body);
+    if (body.loopId) {
+      try {
+        recordLoopRun(LOOPS_STATE_PATH, String(body.loopId), {
+          status: "ok",
+          summary: post.bodyShort,
+        });
+        upsertBrief(BRIEFS_PATH, {
+          loopId: String(body.loopId),
+          agentName: post.agentName,
+          title: post.title,
+          bodyShort: post.bodyShort,
+          bodyLong: post.bodyLong || post.bodyShort,
+          kind: post.kind,
+          postId: post.id,
+          jobId: post.jobId,
+        });
+      } catch {
+        /* last-run / brief stamp is best-effort */
+      }
+    }
+    sendJson(res, 201, { post, unreadCount: standup.unreadCount() });
+  } catch (e) {
+    const code = e?.code === "BAD_POST" ? 400 : 500;
+    sendJson(res, code, {
+      error: e instanceof Error ? e.message : String(e),
+      code: e?.code || "ERROR",
+    });
+  }
+}
+
+async function handleStandupRead(req, res) {
+  if (!authOk(req)) return sendJson(res, 401, { error: "unauthorized" });
+  let body = {};
+  try {
+    const raw = (await readBody(req)).toString("utf8");
+    if (raw.trim()) body = JSON.parse(raw);
+  } catch {
+    return sendJson(res, 400, { error: "invalid json" });
+  }
+  const unreadCount = body.all
+    ? standup.markRead("all")
+    : standup.markRead(body.ids || []);
+  sendJson(res, 200, { unreadCount });
+}
+
+async function handleStandupPins(req, res) {
+  if (!authOk(req)) return sendJson(res, 401, { error: "unauthorized" });
+  let body = {};
+  try {
+    const raw = (await readBody(req)).toString("utf8");
+    if (raw.trim()) body = JSON.parse(raw);
+  } catch {
+    return sendJson(res, 400, { error: "invalid json" });
+  }
+  if (!body.key) return sendJson(res, 400, { error: "key is required" });
+  try {
+    const pins = standup.setPin(body.key, body.value);
+    sendJson(res, 200, { pins });
+  } catch (e) {
+    sendJson(res, 400, { error: e instanceof Error ? e.message : String(e) });
+  }
+}
+
+function handleLoopsList(req, res) {
+  if (!authOk(req)) return sendJson(res, 401, { error: "unauthorized" });
+  const catalog = readLocalLoops(LOOPS_PATH);
+  const state = readLoopState(LOOPS_STATE_PATH);
+  const briefs = readAllBriefs(BRIEFS_PATH);
+  const loops = listLoops(catalog.loops, state).map((loop) => {
+    const brief = briefs[loop.id] || null;
+    return {
+      ...loop,
+      lastBriefAt: brief?.updatedAt || null,
+      readsFrom: loop.role === "synth" ? loop.reads : [],
+    };
+  });
+  sendJson(res, 200, {
+    loops,
+    source: catalog.source,
+    hint:
+      catalog.source === "missing"
+        ? "Copy examples/phone-loops.example.json to ~/.grok/phone-loops.json"
+        : null,
+  });
+}
+
+function handleBriefsList(req, res) {
+  if (!authOk(req)) return sendJson(res, 401, { error: "unauthorized" });
+  sendJson(res, 200, { briefs: readAllBriefs(BRIEFS_PATH) });
+}
+
+function handleBriefGet(req, res, loopId) {
+  if (!authOk(req)) return sendJson(res, 401, { error: "unauthorized" });
+  const brief = readBrief(BRIEFS_PATH, loopId);
+  if (!brief) return sendJson(res, 404, { error: "not found" });
+  sendJson(res, 200, { brief });
+}
+
+function handleLoopInputs(req, res, id) {
+  if (!authOk(req)) return sendJson(res, 401, { error: "unauthorized" });
+  const catalog = readLocalLoops(LOOPS_PATH);
+  const loop = catalog.loops.find((l) => l.id === id);
+  if (!loop) return sendJson(res, 404, { error: "loop not found" });
+  const inputs = gatherSynthInputs(loop, catalog.loops, readAllBriefs(BRIEFS_PATH));
+  sendJson(res, 200, { loopId: loop.id, role: loop.role, inputs });
+}
+
+const loopInFlight = new Set();
+
+function commitLoopOutput(loop, job) {
+  const parsed = parseLoopReport(job.reply);
+  if (!parsed.bodyShort) {
+    throw Object.assign(new Error("loop reply had no SHORT card"), {
+      code: "BAD_REPORT",
+    });
+  }
+  const post = standup.createPost({
+    agentName: loop.name,
+    agentId: loop.id,
+    kind:
+      parsed.kind ||
+      loop.kind ||
+      (loop.role === "synth" ? "standup" : "update"),
+    title: parsed.title || "",
+    bodyShort: parsed.bodyShort,
+    bodyLong: parsed.bodyLong || parsed.bodyShort,
+    jobId: job.id,
+  });
+  upsertBrief(BRIEFS_PATH, {
+    loopId: loop.id,
+    agentName: loop.name,
+    title: post.title,
+    bodyShort: post.bodyShort,
+    bodyLong: post.bodyLong,
+    kind: post.kind,
+    postId: post.id,
+    jobId: job.id,
+  });
+  recordLoopRun(LOOPS_STATE_PATH, loop.id, {
+    status: "ok",
+    summary: post.bodyShort,
+  });
+  return post;
+}
+
+async function runScheduledLoop(loop, opts = {}) {
+  if (!loop?.id) return { error: "no loop" };
+  if (loopInFlight.has(loop.id)) return { error: "already running", loopId: loop.id };
+  loopInFlight.add(loop.id);
+  recordLoopRun(LOOPS_STATE_PATH, loop.id, {
+    status: "running",
+    summary: opts.reason === "manual" ? "Manual run…" : "Running…",
+  });
+  const catalog = readLocalLoops(LOOPS_PATH).loops;
+  const briefs = readAllBriefs(BRIEFS_PATH);
+  const pins = standup.getPins();
+  const prompt =
+    loop.role === "synth"
+      ? buildSynthPrompt(loop, gatherSynthInputs(loop, catalog, briefs), pins)
+      : buildSpecialistPrompt(loop, pins);
+  const id = randomUUID();
+  const now = new Date().toISOString();
+  const job = {
+    id,
+    status: "running",
+    text: prompt,
+    createdAt: now,
+    updatedAt: now,
+    startedAt: now,
+    finishedAt: null,
+    reply: "",
+    tools: [],
+    error: null,
+    sessionId: null,
+    agentId: "loops",
+    loopId: loop.id,
+    loopName: loop.name,
+    source: "loop",
+  };
+  jobs.set(id, job);
+  await persistJob(job);
+  try {
+    const reply = await runHeadlessPrompt(prompt, CWD, 15 * 60 * 1000);
+    job.reply = reply;
+    job.status = "done";
+    job.error = null;
+    job.finishedAt = new Date().toISOString();
+    job.updatedAt = job.finishedAt;
+    await persistJob(job);
+    const post = commitLoopOutput(loop, job);
+    return { jobId: id, post, loopId: loop.id };
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    job.status = "error";
+    job.error = msg;
+    job.finishedAt = new Date().toISOString();
+    job.updatedAt = job.finishedAt;
+    await persistJob(job);
+    recordLoopRun(LOOPS_STATE_PATH, loop.id, {
+      status: "error",
+      summary: msg.slice(0, 200),
+    });
+    return { error: msg, jobId: id, loopId: loop.id };
+  } finally {
+    loopInFlight.delete(loop.id);
+  }
+}
+
+async function tickDueLoops() {
+  const catalog = readLocalLoops(LOOPS_PATH);
+  if (catalog.source !== "local") return;
+  const state = readLoopState(LOOPS_STATE_PATH);
+  const now = Date.now();
+  for (const loop of catalog.loops) {
+    if (!loop.enabled) continue;
+    if (loopInFlight.has(loop.id)) continue;
+    const last = state[loop.id]?.lastRunAt || null;
+    if (!isLoopDue(loop.schedule, last, now)) continue;
+    console.log(`[loops] due ${loop.id}`);
+    void runScheduledLoop(loop, { reason: "schedule" }).then((r) => {
+      if (r?.error) console.warn(`[loops] ${loop.id} failed:`, r.error);
+      else console.log(`[loops] ${loop.id} posted ${r?.post?.id || ""}`);
+    });
+  }
+}
+
+function handleLoopRun(req, res, id) {
+  if (!authOk(req)) return sendJson(res, 401, { error: "unauthorized" });
+  const catalog = readLocalLoops(LOOPS_PATH);
+  const loop = catalog.loops.find((l) => l.id === id);
+  if (!loop) return sendJson(res, 404, { error: "loop not found" });
+  if (loopInFlight.has(loop.id)) {
+    return sendJson(res, 409, { error: "already running", loopId: loop.id });
+  }
+  void runScheduledLoop(loop, { reason: "manual" }).then((r) => {
+    if (r?.error) console.warn(`[loops] ${loop.id} failed:`, r.error);
+  });
+  sendJson(res, 202, { loopId: loop.id, started: true });
 }
 
 /** GET /api/agents */
@@ -2978,6 +3282,40 @@ async function onRequest(req, res) {
     if (req.method === "DELETE" && agentDel) {
       return await handleAgentDelete(req, res, agentDel[1]);
     }
+    if (req.method === "GET" && pathOnly === "/api/loops") {
+      return handleLoopsList(req, res);
+    }
+    const loopRun = pathOnly.match(/^\/api\/loops\/([a-zA-Z0-9_-]+)\/run$/);
+    if (req.method === "POST" && loopRun) {
+      return handleLoopRun(req, res, loopRun[1]);
+    }
+    const loopInputs = pathOnly.match(/^\/api\/loops\/([a-zA-Z0-9_-]+)\/inputs$/);
+    if (req.method === "GET" && loopInputs) {
+      return handleLoopInputs(req, res, loopInputs[1]);
+    }
+    if (req.method === "GET" && pathOnly === "/api/briefs") {
+      return handleBriefsList(req, res);
+    }
+    const briefOne = pathOnly.match(/^\/api\/briefs\/([a-zA-Z0-9_-]+)$/);
+    if (req.method === "GET" && briefOne) {
+      return handleBriefGet(req, res, briefOne[1]);
+    }
+    if (req.method === "GET" && pathOnly === "/api/standup") {
+      return handleStandupFeed(req, res);
+    }
+    if (req.method === "POST" && pathOnly === "/api/standup/posts") {
+      return await handleStandupCreate(req, res);
+    }
+    if (req.method === "POST" && pathOnly === "/api/standup/read") {
+      return await handleStandupRead(req, res);
+    }
+    if (req.method === "PATCH" && pathOnly === "/api/standup/pins") {
+      return await handleStandupPins(req, res);
+    }
+    const standupOne = pathOnly.match(/^\/api\/standup\/([a-zA-Z0-9_-]+)$/);
+    if (req.method === "GET" && standupOne) {
+      return handleStandupPostGet(req, res, standupOne[1]);
+    }
     if (req.method === "GET" && pathOnly === "/api/jobs") {
       return await handleJobsList(req, res);
     }
@@ -3069,3 +3407,15 @@ server.listen(PORT, HOST, () => {
     printBanner();
   });
 });
+
+function startLoopTicker() {
+  setInterval(() => {
+    void tickDueLoops().catch((e) =>
+      console.warn("[loops] tick failed", e?.message || e)
+    );
+  }, 20_000);
+  setTimeout(() => {
+    void tickDueLoops().catch(() => {});
+  }, 8_000);
+}
+startLoopTicker();

@@ -1,6 +1,6 @@
 # Grok CLI Phone Remote Control
 
-Installable **phone remote-control PWA** for your **local [Grok CLI](https://x.ai) / Grok Build agent** (full tools, your workspace). Supports photos, **voice dictation** (live speech→text), slash commands, durable job queue (phone can lock), multi-agent sessions, usage lookup, session reconnect, and inline Imagine images.
+Installable **phone remote-control PWA** for your **local [Grok CLI](https://x.ai) / Grok Build agent** (full tools, your workspace). Supports photos, **voice dictation** (live speech→text), slash commands, durable job queue (phone can lock), multi-agent sessions, a **standup feed** and **loops board** (Menu → Standup / Loops), usage lookup, session reconnect, and inline Imagine images.
 
 **Voice dictation at a glance (no paid Tailscale Serve):**
 
@@ -116,7 +116,7 @@ No paid **Tailscale Serve** plan is required. The Mac generates a **self-signed 
 3. Safari will warn that the certificate is not trusted → **Show Details → visit this website** (or Advanced → proceed).
 4. Optional but durable: **Settings → General → About → Certificate Trust Settings** and enable full trust for the cert if iOS offers it.
 5. Unlock with `PHONE_CHAT_SECRET`, then **Share → Add to Home Screen** from the **HTTPS** tab so the PWA stays on a secure origin.
-6. Tap the mic. Words should stream live. Default spoken send phrase: **bee boop** (change under **Menu → Voice send**).
+6. Tap the mic. Words should stream live. Default spoken send phrase: **bee boop** (change under **Menu → Settings**).
 
 ### Tips and pitfalls
 
@@ -129,7 +129,7 @@ No paid **Tailscale Serve** plan is required. The Mac generates a **self-signed 
 
 ### Spoken send phrase
 
-While dictating, say your send phrase **at the end** of the utterance to auto-send (trigger is stripped). Defaults: `bee boop`, `beep boop`, `b boop`. Edit anytime: **Menu → Voice send** (saved on that phone only via `localStorage`).
+While dictating, say your send phrase **at the end** of the utterance to auto-send (trigger is stripped). Defaults: `bee boop`, `beep boop`, `b boop`. Edit anytime: **Menu → Settings** (saved on that phone only via `localStorage`).
 
 ---
 
@@ -183,7 +183,10 @@ https://<mac-tailscale-ip>:8788
 - Chat with the local agent (tools, skills, MCP as configured for Grok on that machine)
 - Photo attach (library / camera) → saved under `~/.grok/phone-inbox/`
 - **Voice dictation:** live Web Speech on free HTTPS, keyboard STT on HTTP, Mac STT fallback; configurable spoken send phrase
-- **Multi-agent:** Menu → spawn concurrent Grok processes; header **To** chip switches chat; Stop kills that process on the Mac
+- **Pages:** Menu opens Standup, Agents, Loops, Jobs, and Settings (chat stays the home view)
+- **Standup feed:** newspaper-style posts from loops; tap the goal card for the first-principles algorithm
+- **Loops board:** host-local catalog; specialists post a card + brief, a synth (CoS) reads those briefs and writes standup
+- **Multi-agent:** Menu → Agents to spawn concurrent Grok processes; header **To** chip switches chat; Stop kills that process on the Mac
 - Durable jobs under `~/.grok/phone-jobs/` (phone may lock; work continues on the host)
 - **Live reply push** via Server-Sent Events (`GET /api/jobs/:id/stream`) so finished answers hit the phone immediately (polling is only a backup). WebRTC is unnecessary for this; SSE is the simple phone↔host push channel.
 - **Reset** button: cancel queue + restart agent session
@@ -191,6 +194,128 @@ https://<mac-tailscale-ip>:8788
 - Slash catalog for common CLI / tool shortcuts
 - Markdown replies; generated Imagine images served inline when available
 - Auto-recovery: hung agent turns fall back to a one-shot `grok -p` so a final message still arrives
+
+---
+
+## Standup, loops, and pages
+
+There is no lock-screen push. The phone PWA is the inbox: loops write English posts into a local standup feed, and you open **Menu → Standup** to read them. The hamburger is a set of circular icon buttons. Chat stays the home screen.
+
+| Menu item | What it is |
+|-----------|------------|
+| **Standup** | Goal pin + chronological posts. Opening the page marks posts read. Unread count is part of the menu badge. |
+| **Agents** | Concurrent Grok processes on the Mac. Spawn, rename, stop. Header **To** chip still cycles the send target. |
+| **Loops** | What is scheduled, next fire, last run. Specialists write briefs; a synth reads them. **Run now** to fire one. |
+| **Jobs** | Durable queue / recovery (Stop & show, Cancel). Not in the top bar. |
+| **Settings** | Spoken send phrase (device `localStorage` only). |
+
+### Standup feed
+
+A short newspaper, not a chat dump. Each post is one English card (`standup` / `update` / `alert` / `win`). Tap a card for the long body.
+
+**Pinned goal.** The card at the top shows `north_star` and an optional `first_principle` line (plus `mrr` if you set it). Tap the goal — icon on the left of the title/subtitle — to open the **First principles** page.
+
+**First principles is always in the app.** The five-step algorithm (question every requirement → delete → simplify → accelerate → automate) is committed UI, not optional seed text. Personal *application* of that algorithm belongs in the host seed, never in git.
+
+**Personal pins stay on the host.** Create `~/.grok/phone-standup-seed.json` (never commit this file):
+
+```json
+{
+  "north_star": "Your north-star goal in one line",
+  "first_principle": "How you apply first principles this month",
+  "mrr": "Optional extra pin line"
+}
+```
+
+Missing keys fall back to generic copy (“Set a north-star goal”). The feed store is `~/.grok/phone-standup.db` on Node 22+ (`node:sqlite`), or `~/.grok/phone-standup.json` on Node 20.
+
+**Write a post** (auth same as every `/api/*` route):
+
+```bash
+curl -sS -X POST http://127.0.0.1:8787/api/standup/posts \
+  -H "Authorization: Bearer $PHONE_CHAT_SECRET" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "agentName": "Morning brief",
+    "kind": "standup",
+    "title": "Monday",
+    "bodyShort": "What moved, what is blocked, one ask.",
+    "bodyLong": "Optional long version.",
+    "loopId": "morning-brief"
+  }'
+```
+
+`agentName` and `bodyShort` are required. `kind` is one of `standup`, `update`, `alert`, `win`. If `loopId` matches a loop in the catalog, last-run is stamped on that loop.
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| `GET` | `/api/standup` | Pins, posts, `unreadCount` (`?limit=`, default 80) |
+| `GET` | `/api/standup/:id` | One post + pins |
+| `POST` | `/api/standup/posts` | Create a post; optional `loopId` stamps last run |
+| `POST` | `/api/standup/read` | `{ "all": true }` or `{ "ids": ["…"] }` |
+| `PATCH` | `/api/standup/pins` | `{ "key": "north_star", "value": "…" }` |
+
+### Loops board
+
+Loops are a **local catalog**, not something checked into the repo. Anyone can set up the same shape:
+
+```bash
+cp examples/phone-loops.example.json ~/.grok/phone-loops.json
+# edit names, times, timezone — keep personal strategy out of git
+```
+
+Then **Menu → Loops**. Each card shows name, description, a human schedule line, next run, and last run. Disabled loops show as paused. If the file is missing, the page tells you to copy the example.
+
+**Specialist vs synth.** Each loop is a `specialist` (default) or a `synth`. Specialists do the work and leave a **short feed card** plus a **detailed brief**. A synth loop (morning brief / chief of staff) does **not** re-research — it reads those briefs and writes the standup. If a specialist has no brief today, the synth must say “no report” for that beat.
+
+```json
+{
+  "id": "morning-brief",
+  "role": "synth",
+  "reads": ["ads-health", "inbox-watch"],
+  "kind": "standup",
+  "prompt": "Quote the specialist briefs. Missing brief → no report."
+}
+```
+
+`reads` is a list of loop ids. Omit it and a synth reads every other enabled specialist.
+
+**Briefs** live in `~/.grok/phone-briefs.json` (latest per loop). They are also the long body on the standup card — tap a specialist post to read the brief. Creating a standup post with `loopId` upserts that loop’s brief.
+
+**Loops run on the Mac** while the bridge is up (one-shot `grok -p`, not the main chat session). Due slots fire in a ~90s window; a missed morning does **not** catch up at 3pm. **Run now** on the Loops page starts one immediately. Last run stays “Never ran” until a run posts.
+
+The Mac must stay awake. Loop jobs do not appear in the main chat.
+
+Schedule object on each loop:
+
+| `kind` | Fields | Meaning |
+|--------|--------|---------|
+| `weekdays` | `time` (`HH:MM`), `tz` (IANA) | Mon–Fri at that clock time |
+| `daily` | `time`, `tz` | Every day at that clock time |
+| `hourly` | `start`, `end`, `days` (`weekdays` or `daily`), `tz` | On the start minute, between start and end |
+
+`enabled: false` hides the next-run time. Default timezone if omitted is `America/New_York`.
+
+`GET /api/loops` returns `{ loops, source: "local"|"missing", hint }`. Each loop includes `role`, `readsFrom`, `lastBriefAt`, `scheduleLabel`, `nextRunAt`, `lastRunAt`.
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| `GET` | `/api/briefs` | Latest brief per loop |
+| `GET` | `/api/briefs/:loopId` | One brief |
+| `GET` | `/api/loops/:id/inputs` | What a synth would read right now (present / no report) |
+| `POST` | `/api/loops/:id/run` | Run that loop now (202). Does not wait for the agent. |
+
+### Host-only files (do not commit)
+
+| Path | Role |
+|------|------|
+| `~/.grok/phone-standup.db` or `~/.grok/phone-standup.json` | Feed + pins store |
+| `~/.grok/phone-standup-seed.json` | Personal goal / pin seed |
+| `~/.grok/phone-loops.json` | Loop catalog (copy from `examples/phone-loops.example.json`) |
+| `~/.grok/phone-loops-state.json` | Last-run stamps |
+| `~/.grok/phone-briefs.json` | Latest specialist brief per loop |
+
+The committed example (`examples/phone-loops.example.json`) is generic on purpose: morning brief, ads health, inbox watch. Put real loop names and goals only under `~/.grok/`.
 
 ---
 
@@ -256,6 +381,7 @@ This project is open source. **Before every commit and push to GitHub**, confirm
 | Private network | Home LAN addresses, personal VPN hostnames if sensitive |
 | Personal identity | Personal email addresses, filled-in LaunchAgent plists, machine labels |
 | Runtime data | `~/.grok/phone-jobs`, inbox images, logs, `.env` with real values |
+| Standup / loops | `~/.grok/phone-standup.db`, `phone-standup.json`, `phone-standup-seed.json`, `phone-loops.json`, `phone-loops-state.json`, `phone-briefs.json` — personal goals, briefs, last-run stamps |
 
 **Required check (also runs in `npm test` via `test/no-local-leaks.test.mjs`):**
 
@@ -296,9 +422,9 @@ Layout:
 ```text
 server.mjs          # HTTP + free HTTPS + ACP bridge + job queue
 public/             # PWA (HTML/CSS/JS, service worker, icons)
-lib/                # ACP, jobs, dictation, free TLS helpers
+lib/                # ACP, jobs, dictation, standup, loops, free TLS helpers
 .grok/skills/       # project skills (phone setup / best use)
-examples/           # templates with placeholders only
+examples/           # templates with placeholders only (incl. phone-loops.example.json)
 test/               # node:test suite
 scripts/            # repo hygiene helpers
 THIRD_PARTY.md      # vendored client library attribution

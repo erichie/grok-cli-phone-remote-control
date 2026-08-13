@@ -1,0 +1,47 @@
+{
+  "loops": [
+    {
+      "id": "ads-health",
+      "name": "Ads health",
+      "description": "Check paid spend vs plan. Short card plus a detailed brief with numbers.",
+      "enabled": true,
+      "role": "specialist",
+      "kind": "update",
+      "schedule": {
+        "kind": "weekdays",
+        "time": "08:05",
+        "tz": "America/New_York"
+      }
+    },
+    {
+      "id": "inbox-watch",
+      "name": "Inbox watch",
+      "description": "Scan the inbox during business hours. Post only if someone replied. Brief lists who and what they said.",
+      "enabled": true,
+      "role": "specialist",
+      "kind": "update",
+      "schedule": {
+        "kind": "hourly",
+        "start": "10:00",
+        "end": "18:00",
+        "days": "weekdays",
+        "tz": "America/New_York"
+      }
+    },
+    {
+      "id": "morning-brief",
+      "name": "Morning brief",
+      "description": "Chief of Staff standup: read specialist briefs and write yesterday / today / one ask. Do not invent missing numbers.",
+      "enabled": true,
+      "role": "synth",
+      "reads": ["ads-health", "inbox-watch"],
+      "kind": "standup",
+      "prompt": "Quote the specialist briefs. If a brief is missing, write no report for that beat.",
+      "schedule": {
+        "kind": "weekdays",
+        "time": "08:20",
+        "tz": "America/New_York"
+      }
+    }
+  ]
+}

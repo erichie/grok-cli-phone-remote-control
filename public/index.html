@@ -13,7 +13,7 @@
     <meta name="application-name" content="Grok" />
     <link rel="manifest" href="/manifest.webmanifest" />
     <link rel="apple-touch-icon" href="/icon-192.png" />
-    <link rel="stylesheet" href="/styles.css?v=50" />
+    <link rel="stylesheet" href="/styles.css?v=55" />
     <title>Grok</title>
     <script src="/marked.min.js"></script>
     <script src="/purify.min.js"></script>
@@ -25,7 +25,7 @@
           type="button"
           id="menu-btn"
           class="menu-btn"
-          title="Jobs and agents on the Mac"
+          title="Menu"
           aria-label="Open menu"
           aria-controls="activity-panel"
           aria-expanded="false"
@@ -167,72 +167,163 @@
       >
         <div class="activity-header">
           <h2>Menu</h2>
-          <button type="button" id="activity-close" class="header-btn" aria-label="Close menu">
-            Close
+          <button type="button" id="activity-close" class="glass-btn" aria-label="Close menu">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>
           </button>
         </div>
         <div class="activity-body">
-          <section class="activity-section" aria-labelledby="activity-agents-title">
-            <div class="activity-section-head">
-              <h3 id="activity-agents-title">Agents</h3>
-              <button type="button" id="activity-spawn" class="activity-link-btn" title="Spawn another Grok process on the Mac">
-                + Agent
-              </button>
-            </div>
-            <p class="activity-hint">
-              Tap an agent to open its chat. Rename anytime. Stop kills that process on the Mac.
-            </p>
-            <div id="activity-agents" class="activity-list"></div>
-          </section>
-          <section class="activity-section" aria-labelledby="activity-jobs-title">
-            <div class="activity-section-head">
-              <h3 id="activity-jobs-title">Jobs</h3>
-              <button type="button" id="activity-refresh" class="activity-link-btn" title="Refresh from Mac">
-                Refresh
-              </button>
-            </div>
-            <div id="activity-jobs" class="activity-list"></div>
-          </section>
-          <section class="activity-section" aria-labelledby="activity-voice-title">
-            <div class="activity-section-head">
-              <h3 id="activity-voice-title">Voice send</h3>
-              <button
-                type="button"
-                id="voice-trigger-reset"
-                class="activity-link-btn"
-                title="Restore default phrases"
-              >
-                Default
-              </button>
-            </div>
-            <p class="activity-hint">
-              While dictating, say this phrase at the end to send. Comma-separate aliases (STT mishears).
-              Saved on this phone only.
-            </p>
-            <label class="voice-trigger-label" for="voice-trigger-input">
-              Phrase(s)
-            </label>
-            <input
-              id="voice-trigger-input"
-              class="voice-trigger-input"
-              type="text"
-              autocomplete="off"
-              autocorrect="off"
-              spellcheck="false"
-              enterkeyhint="done"
-              placeholder="bee boop, beep boop"
-              aria-describedby="voice-trigger-status"
-            />
-            <div class="voice-trigger-actions">
-              <button type="button" id="voice-trigger-save" class="voice-trigger-save">
-                Save phrase
-              </button>
-              <span id="voice-trigger-status" class="voice-trigger-status" aria-live="polite"></span>
-            </div>
-          </section>
+          <nav class="activity-nav" aria-label="Pages">
+            <button type="button" id="nav-standup" class="activity-nav-btn">
+              <span class="activity-nav-label">Standup</span>
+              <span id="standup-nav-badge" class="activity-nav-badge hidden">0</span>
+            </button>
+            <button type="button" id="nav-agents" class="activity-nav-btn">
+              <span class="activity-nav-label">Agents</span>
+            </button>
+            <button type="button" id="nav-loops" class="activity-nav-btn">
+              <span class="activity-nav-label">Loops</span>
+            </button>
+            <button type="button" id="nav-jobs" class="activity-nav-btn">
+              <span class="activity-nav-label">Jobs</span>
+            </button>
+            <button type="button" id="nav-settings" class="activity-nav-btn">
+              <span class="activity-nav-label">Settings</span>
+            </button>
+          </nav>
         </div>
       </aside>
     </div>
+
+    <!-- Full-screen pages (standup / jobs / settings) -->
+    <section id="page-standup" class="app-page hidden" aria-hidden="true">
+      <div class="page-header">
+        <button type="button" class="glass-btn" data-close-page="standup" aria-label="Close">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>
+        </button>
+        <h1>Standup</h1>
+        <span class="glass-btn glass-btn-spacer" aria-hidden="true"></span>
+      </div>
+      <div class="page-body">
+        <header id="standup-pin" class="standup-pin"></header>
+        <div id="standup-feed" class="standup-feed"></div>
+      </div>
+    </section>
+
+    <section id="page-principles" class="app-page hidden" aria-hidden="true">
+      <div class="page-header">
+        <button type="button" class="glass-btn" data-close-page="principles" aria-label="Back">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 18l-6-6 6-6"/></svg>
+        </button>
+        <h1>First principles</h1>
+        <span class="glass-btn glass-btn-spacer" aria-hidden="true"></span>
+      </div>
+      <div id="principles-body" class="page-body principles-body"></div>
+    </section>
+
+    <section id="page-standup-detail" class="app-page hidden" aria-hidden="true">
+      <div class="page-header">
+        <button type="button" class="glass-btn" data-close-page="standup-detail" aria-label="Back">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 18l-6-6 6-6"/></svg>
+        </button>
+        <h1>Post</h1>
+        <span class="glass-btn glass-btn-spacer" aria-hidden="true"></span>
+      </div>
+      <div id="standup-detail" class="page-body standup-detail"></div>
+    </section>
+
+    <section id="page-agents" class="app-page hidden" aria-hidden="true">
+      <div class="page-header">
+        <button type="button" class="glass-btn" data-close-page="agents" aria-label="Close">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>
+        </button>
+        <h1>Agents</h1>
+        <button type="button" id="activity-spawn" class="glass-btn" aria-label="New agent" title="Spawn another Grok process on the Mac">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+        </button>
+      </div>
+      <div class="page-body">
+        <p class="page-lead">Tap an agent to open its chat. Stop kills that process on the Mac.</p>
+        <div id="page-agents-list" class="activity-list page-agents-list"></div>
+      </div>
+    </section>
+
+    <section id="page-loops" class="app-page hidden" aria-hidden="true">
+      <div class="page-header">
+        <button type="button" class="glass-btn" data-close-page="loops" aria-label="Close">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>
+        </button>
+        <h1>Loops</h1>
+        <span class="glass-btn glass-btn-spacer" aria-hidden="true"></span>
+      </div>
+      <div class="page-body">
+        <p class="page-lead">Scheduled work on this Mac. Specialists write a short card plus a detailed brief. A synth loop (morning brief) reads those briefs and writes the standup. Edit ~/.grok/phone-loops.json — copy the example in the repo to start.</p>
+        <div id="page-loops-list" class="loop-list"></div>
+      </div>
+    </section>
+
+    <section id="page-jobs" class="app-page hidden" aria-hidden="true">
+      <div class="page-header">
+        <button type="button" class="glass-btn" data-close-page="jobs" aria-label="Close">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>
+        </button>
+        <h1>Jobs</h1>
+        <button type="button" id="activity-refresh" class="glass-btn" aria-label="Refresh" title="Refresh from Mac">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 12a9 9 0 1 1-2.6-6.3M21 5v5h-5"/></svg>
+        </button>
+      </div>
+      <div class="page-body">
+        <div id="page-jobs-list" class="job-list"></div>
+      </div>
+    </section>
+
+    <section id="page-settings" class="app-page hidden" aria-hidden="true">
+      <div class="page-header">
+        <button type="button" class="glass-btn" data-close-page="settings" aria-label="Close">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>
+        </button>
+        <h1>Settings</h1>
+        <span class="glass-btn glass-btn-spacer" aria-hidden="true"></span>
+      </div>
+      <div class="page-body settings-body">
+        <section class="activity-section" aria-labelledby="activity-voice-title">
+          <div class="activity-section-head">
+            <h3 id="activity-voice-title">Voice send</h3>
+            <button
+              type="button"
+              id="voice-trigger-reset"
+              class="activity-link-btn"
+              title="Restore default phrases"
+            >
+              Default
+            </button>
+          </div>
+          <p class="activity-hint">
+            While dictating, say this phrase at the end to send. Comma-separate aliases (STT mishears).
+            Saved on this phone only.
+          </p>
+          <label class="voice-trigger-label" for="voice-trigger-input">
+            Phrase(s)
+          </label>
+          <input
+            id="voice-trigger-input"
+            class="voice-trigger-input"
+            type="text"
+            autocomplete="off"
+            autocorrect="off"
+            spellcheck="false"
+            enterkeyhint="done"
+            placeholder="bee boop, beep boop"
+            aria-describedby="voice-trigger-status"
+          />
+          <div class="voice-trigger-actions">
+            <button type="button" id="voice-trigger-save" class="voice-trigger-save">
+              Save phrase
+            </button>
+            <span id="voice-trigger-status" class="voice-trigger-status" aria-live="polite"></span>
+          </div>
+        </section>
+      </div>
+    </section>
 
     <!-- Actions: photo (system picker) + tools -->
     <div id="actions-sheet" class="sheet hidden" aria-hidden="true">
@@ -250,6 +341,6 @@
       </div>
     </div>
 
-    <script type="module" src="/app.js?v=50"></script>
+    <script type="module" src="/app.js?v=55"></script>
   </body>
 </html>

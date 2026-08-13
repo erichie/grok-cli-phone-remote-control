@@ -16,6 +16,13 @@ import {
   chatAgentIdPayload,
 } from "./activity-ui.mjs";
 import {
+  formatFeedTime,
+  kindLabel,
+  combineMenuBadge,
+  FIRST_PRINCIPLES_STEPS,
+} from "./standup-ui.mjs";
+import { lastRunLabel, nextRunLabel } from "./loops-ui.mjs";
+import {
   getSpeechRecognitionCtor,
   isSpeechRecognitionSupported,
   isMediaRecorderDictationSupported,
@@ -56,8 +63,26 @@ const activityBackdrop = $("activity-backdrop");
 const activityClose = $("activity-close");
 const activitySpawn = $("activity-spawn");
 const activityRefresh = $("activity-refresh");
-const activityAgents = $("activity-agents");
-const activityJobs = $("activity-jobs");
+const pageAgentsList = $("page-agents-list");
+const pageJobsList = $("page-jobs-list");
+const navStandup = $("nav-standup");
+const navAgents = $("nav-agents");
+const navJobs = $("nav-jobs");
+const navLoops = $("nav-loops");
+const navSettings = $("nav-settings");
+const pageLoops = $("page-loops");
+const pageLoopsList = $("page-loops-list");
+const standupNavBadge = $("standup-nav-badge");
+const pageStandup = $("page-standup");
+const pageStandupDetail = $("page-standup-detail");
+const pagePrinciples = $("page-principles");
+const pageAgents = $("page-agents");
+const pageJobs = $("page-jobs");
+const pageSettings = $("page-settings");
+const standupPin = $("standup-pin");
+const standupFeed = $("standup-feed");
+const standupDetail = $("standup-detail");
+const principlesBody = $("principles-body");
 const agentChipBar = $("agent-chip-bar");
 const agentChip = $("agent-chip");
 const secretInput = $("secret");
@@ -121,6 +146,10 @@ let selectedAgentId =
 let activityPollTimer = null;
 let activityOpen = false;
 let activityBusy = false;
+let standupUnread = 0;
+/** @type {{ pins?: object, posts?: Array } | null} */
+let standupCache = null;
+let openPageName = "";
 
 /** Normalize agent id used for local history buckets. */
 function historyAgentId(agentId) {
@@ -1085,9 +1114,19 @@ function updateMenuBadge() {
   if (!menuBadge) return;
   // Only when an agent finished a turn and is idle / ready for the user
   // (not while working, not "you have N agents")
-  const n = activityBadgeCount(knownJobs, knownAgents, {
+  const ready = activityBadgeCount(knownJobs, knownAgents, {
     selectedAgentId: historyAgentId(selectedAgentId),
   });
+  const n = combineMenuBadge(ready, standupUnread);
+  if (standupNavBadge) {
+    if (standupUnread > 0) {
+      standupNavBadge.textContent = standupUnread > 99 ? "99+" : String(standupUnread);
+      standupNavBadge.classList.remove("hidden");
+    } else {
+      standupNavBadge.textContent = "0";
+      standupNavBadge.classList.add("hidden");
+    }
+  }
   if (n > 0) {
     menuBadge.textContent = n > 99 ? "99+" : String(n);
     menuBadge.classList.remove("hidden");
@@ -1155,6 +1194,7 @@ async function refreshActivity(opts = {}) {
     const j = await res.json();
     knownJobs = Array.isArray(j.jobs) ? j.jobs : [];
     knownAgents = Array.isArray(j.agents) ? j.agents : knownAgents;
+    if (typeof j.standupUnread === "number") standupUnread = j.standupUnread;
     const nextSel = historyAgentId(
       normalizeSelectedAgentId(knownAgents, selectedAgentId)
     );
@@ -1166,7 +1206,12 @@ async function refreshActivity(opts = {}) {
       updateMenuBadge();
       updateAgentChip();
     }
-    if (activityOpen || opts.force) {
+    if (
+      activityOpen ||
+      opts.force ||
+      openPageName === "jobs" ||
+      openPageName === "agents"
+    ) {
       renderActivityAgents();
       renderActivityJobs();
     }
@@ -1178,8 +1223,8 @@ async function refreshActivity(opts = {}) {
 }
 
 function renderActivityAgents() {
-  if (!activityAgents) return;
-  activityAgents.innerHTML = "";
+  if (!pageAgentsList) return;
+  pageAgentsList.innerHTML = "";
   const list = knownAgents.length
     ? knownAgents
     : [{ id: "main", label: "Main", isMain: true, alive: false }];
@@ -1199,11 +1244,13 @@ function renderActivityAgents() {
     card.onclick = (e) => {
       // Ignore clicks on action buttons (Stop)
       if (e.target.closest(".activity-action")) return;
+      closeAppPages();
       setSelectedAgentId(agent.id, { closeMenu: true });
     };
     card.onkeydown = (e) => {
       if (e.key === "Enter" || e.key === " ") {
         e.preventDefault();
+        closeAppPages();
         setSelectedAgentId(agent.id, { closeMenu: true });
       }
     };
@@ -1255,59 +1302,434 @@ function renderActivityAgents() {
     actions.appendChild(stopBtn);
 
     card.append(top, meta, actions);
-    activityAgents.appendChild(card);
+    pageAgentsList.appendChild(card);
   }
 }
 
 function renderActivityJobs() {
-  if (!activityJobs) return;
-  activityJobs.innerHTML = "";
+  if (!pageJobsList) return;
+  pageJobsList.innerHTML = "";
   const { active, recent } = partitionJobs(knownJobs);
   if (!active.length && !recent.length) {
     const empty = document.createElement("div");
     empty.className = "activity-empty";
     empty.textContent = "No jobs yet.";
-    activityJobs.appendChild(empty);
+    pageJobsList.appendChild(empty);
     return;
   }
   if (active.length) {
     const head = document.createElement("div");
-    head.className = "activity-subhead";
+    head.className = "job-section";
     head.textContent = "Active";
-    activityJobs.appendChild(head);
-    for (const job of active) activityJobs.appendChild(jobCard(job));
+    pageJobsList.appendChild(head);
+    for (const job of active) pageJobsList.appendChild(jobCard(job));
   }
   if (recent.length) {
     const head = document.createElement("div");
-    head.className = "activity-subhead";
+    head.className = "job-section";
     head.textContent = "Recent";
-    activityJobs.appendChild(head);
-    for (const job of recent) activityJobs.appendChild(jobCard(job));
+    pageJobsList.appendChild(head);
+    for (const job of recent) pageJobsList.appendChild(jobCard(job));
+  }
+}
+
+function allAppPages() {
+  return [
+    pageStandup,
+    pageStandupDetail,
+    pagePrinciples,
+    pageAgents,
+    pageLoops,
+    pageJobs,
+    pageSettings,
+  ].filter(Boolean);
+}
+
+function closeAppPages() {
+  for (const el of allAppPages()) {
+    el.classList.add("hidden");
+    el.setAttribute("aria-hidden", "true");
+  }
+  openPageName = "";
+}
+
+function showAppPage(name) {
+  closeAppPages();
+  const map = {
+    standup: pageStandup,
+    "standup-detail": pageStandupDetail,
+    principles: pagePrinciples,
+    agents: pageAgents,
+    loops: pageLoops,
+    jobs: pageJobs,
+    settings: pageSettings,
+  };
+  const el = map[name];
+  if (!el) return;
+  el.classList.remove("hidden");
+  el.setAttribute("aria-hidden", "false");
+  openPageName = name;
+  closeActivityMenu();
+}
+
+async function openStandupPage() {
+  showAppPage("standup");
+  await loadStandupFeed({ markAllRead: true });
+}
+
+async function openJobsPage() {
+  showAppPage("jobs");
+  await refreshActivity({ force: true });
+}
+
+function openSettingsPage() {
+  showAppPage("settings");
+  syncVoiceTriggerForm({ clearStatus: true });
+}
+
+async function openLoopsPage() {
+  showAppPage("loops");
+  await loadLoopsPage();
+}
+
+async function loadLoopsPage() {
+  if (!pageLoopsList) return;
+  const secret = getSecret();
+  if (!secret) return;
+  pageLoopsList.innerHTML = "";
+  try {
+    const res = await fetch("/api/loops", {
+      headers: { Authorization: `Bearer ${secret}` },
+      cache: "no-store",
+    });
+    if (!res.ok) throw new Error("failed");
+    const data = await res.json();
+    renderLoopsList(data);
+  } catch {
+    const empty = document.createElement("div");
+    empty.className = "loop-empty";
+    empty.textContent = "Could not load loops.";
+    pageLoopsList.appendChild(empty);
+  }
+}
+
+function renderLoopsList(data) {
+  pageLoopsList.innerHTML = "";
+  const loops = Array.isArray(data?.loops) ? data.loops : [];
+  if (!loops.length) {
+    const empty = document.createElement("div");
+    empty.className = "loop-empty";
+    empty.textContent =
+      data?.hint ||
+      "No loops yet. Copy examples/phone-loops.example.json to your host loops file.";
+    pageLoopsList.appendChild(empty);
+    return;
+  }
+  for (const loop of loops) {
+    const card = document.createElement("div");
+    card.className = "loop-card" + (loop.enabled === false ? " off" : "");
+    const name = document.createElement("p");
+    name.className = "loop-card-name";
+    name.textContent = loop.name;
+    card.appendChild(name);
+    const role = document.createElement("p");
+    role.className = "loop-card-role";
+    role.textContent =
+      loop.role === "synth"
+        ? "Reads specialist briefs and writes the standup"
+        : "Writes a short card + a detailed brief";
+    card.appendChild(role);
+    if (loop.description) {
+      const desc = document.createElement("p");
+      desc.className = "loop-card-desc";
+      desc.textContent = loop.description;
+      card.appendChild(desc);
+    }
+    const meta = document.createElement("div");
+    meta.className = "loop-card-meta";
+    const sched = document.createElement("span");
+    sched.textContent = loop.scheduleLabel || "Unscheduled";
+    const next = document.createElement("span");
+    next.textContent = loop.enabled === false ? "Paused" : nextRunLabel(loop.nextRunAt);
+    const last = document.createElement("span");
+    last.textContent = lastRunLabel(loop.lastRunAt);
+    meta.append(sched, next, last);
+    if (loop.role === "synth" && Array.isArray(loop.readsFrom) && loop.readsFrom.length) {
+      const reads = document.createElement("span");
+      reads.textContent = `Reads ${loop.readsFrom.join(", ")}`;
+      meta.appendChild(reads);
+    }
+    if (loop.lastBriefAt) {
+      const brief = document.createElement("span");
+      brief.textContent = `Brief ${formatFeedTime(loop.lastBriefAt)}`;
+      meta.appendChild(brief);
+    }
+    card.appendChild(meta);
+    if (loop.enabled !== false) {
+      const run = document.createElement("button");
+      run.type = "button";
+      run.className = "loop-run";
+      run.textContent = "Run now";
+      run.onclick = () => void runLoopNow(loop.id, run);
+      card.appendChild(run);
+    }
+    pageLoopsList.appendChild(card);
+  }
+}
+
+async function runLoopNow(id, btn) {
+  const secret = getSecret();
+  if (!secret || !id) return;
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = "Running…";
+  }
+  try {
+    const res = await fetch(`/api/loops/${encodeURIComponent(id)}/run`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${secret}` },
+    });
+    if (res.status === 409) {
+      if (btn) btn.textContent = "Already running";
+      return;
+    }
+    if (!res.ok) throw new Error("failed");
+    if (btn) btn.textContent = "Started";
+    setTimeout(() => void loadLoopsPage(), 4000);
+  } catch {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = "Run failed";
+    }
+  }
+}
+
+function openAgentsPage() {
+  showAppPage("agents");
+  renderActivityAgents();
+  void refreshActivity({ force: true });
+}
+
+function openPrinciplesPage() {
+  showAppPage("principles");
+  renderPrinciplesPage();
+}
+
+async function loadStandupFeed(opts = {}) {
+  const secret = getSecret();
+  if (!secret) return;
+  try {
+    const res = await fetch("/api/standup", {
+      headers: { Authorization: `Bearer ${secret}` },
+      cache: "no-store",
+    });
+    if (!res.ok) return;
+    const data = await res.json();
+    standupCache = data;
+    standupUnread = Number(data.unreadCount || 0);
+    renderStandupPin(data.pins || {});
+    renderStandupFeed(data.posts || []);
+    updateMenuBadge();
+    if (opts.markAllRead && standupUnread > 0) {
+      await fetch("/api/standup/read", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${secret}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ all: true }),
+      });
+      standupUnread = 0;
+      updateMenuBadge();
+      for (const p of data.posts || []) p.readAt = p.readAt || new Date().toISOString();
+      renderStandupFeed(data.posts || []);
+    }
+  } catch {
+    /* offline */
+  }
+}
+
+function renderStandupPin(pins) {
+  if (!standupPin) return;
+  standupPin.innerHTML = "";
+  const goal = document.createElement("button");
+  goal.type = "button";
+  goal.className = "standup-goal";
+  goal.setAttribute("aria-label", "Open first principles");
+  goal.onclick = () => openPrinciplesPage();
+
+  const icon = document.createElement("div");
+  icon.className = "standup-goal-icon";
+  icon.innerHTML =
+    '<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="2.2"/><path d="M12 3v4.2M12 16.8V21M3 12h4.2M16.8 12H21M5.6 5.6l3 3M15.4 15.4l3 3M18.4 5.6l-3 3M8.6 15.4l-3 3"/></svg>';
+
+  const star = document.createElement("p");
+  star.className = "standup-pin-star";
+  star.textContent = pins.north_star || "Set a north-star goal";
+
+  const principle = document.createElement("p");
+  principle.className = "standup-pin-principle";
+  principle.textContent =
+    pins.first_principle || "Tap for the first-principles algorithm.";
+
+  const copy = document.createElement("div");
+  copy.className = "standup-goal-copy";
+  copy.append(star, principle);
+  goal.append(icon, copy);
+  standupPin.appendChild(goal);
+  if (pins.mrr) {
+    const mrr = document.createElement("p");
+    mrr.className = "standup-pin-mrr";
+    mrr.textContent = pins.mrr;
+    standupPin.appendChild(mrr);
+  }
+}
+
+function renderPrinciplesPage() {
+  if (!principlesBody) return;
+  principlesBody.innerHTML = "";
+  const lede = document.createElement("p");
+  lede.className = "principles-lede";
+  lede.textContent =
+    "Reason from fundamental truths, not analogy. Then apply the algorithm in order — skip a step and the later ones make the wrong thing faster.";
+  principlesBody.appendChild(lede);
+  for (const step of FIRST_PRINCIPLES_STEPS) {
+    const row = document.createElement("div");
+    row.className = "principle-step";
+    const n = document.createElement("div");
+    n.className = "principle-n";
+    n.textContent = step.n;
+    const copy = document.createElement("div");
+    const h = document.createElement("h2");
+    h.textContent = step.title;
+    const p = document.createElement("p");
+    p.textContent = step.body;
+    copy.append(h, p);
+    row.append(n, copy);
+    principlesBody.appendChild(row);
+  }
+}
+
+function renderStandupFeed(posts) {
+  if (!standupFeed) return;
+  standupFeed.innerHTML = "";
+  if (!posts.length) {
+    const empty = document.createElement("div");
+    empty.className = "standup-empty";
+    empty.textContent = "No posts yet. Loops will land here in English.";
+    standupFeed.appendChild(empty);
+    return;
+  }
+  for (const post of posts) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = `standup-card ${post.kind || "update"}${post.readAt ? "" : " unread"}`;
+    btn.onclick = () => void openStandupDetail(post.id);
+
+    const top = document.createElement("div");
+    top.className = "standup-card-top";
+    const name = document.createElement("span");
+    name.className = "standup-card-name";
+    name.textContent = post.agentName || "Agent";
+    const meta = document.createElement("span");
+    meta.className = "standup-card-meta";
+    meta.textContent = `· ${formatFeedTime(post.createdAt)}`;
+    const kind = document.createElement("span");
+    kind.className = "standup-card-kind";
+    kind.textContent = kindLabel(post.kind);
+    top.append(name, meta, kind);
+
+    if (post.title) {
+      const title = document.createElement("p");
+      title.className = "standup-card-title";
+      title.textContent = post.title;
+      btn.append(top, title);
+    } else {
+      btn.appendChild(top);
+    }
+    const body = document.createElement("p");
+    body.className = "standup-card-body";
+    body.textContent = post.bodyShort || "";
+    btn.appendChild(body);
+    standupFeed.appendChild(btn);
+  }
+}
+
+async function openStandupDetail(id) {
+  const secret = getSecret();
+  if (!secret || !id) return;
+  let post = standupCache?.posts?.find((p) => p.id === id) || null;
+  try {
+    const res = await fetch(`/api/standup/${encodeURIComponent(id)}`, {
+      headers: { Authorization: `Bearer ${secret}` },
+      cache: "no-store",
+    });
+    if (res.ok) {
+      const data = await res.json();
+      post = data.post || post;
+    }
+  } catch {
+    /* use cache */
+  }
+  if (!post || !standupDetail) return;
+  showAppPage("standup-detail");
+  standupDetail.innerHTML = "";
+  const name = document.createElement("p");
+  name.className = "standup-detail-name";
+  name.textContent = post.agentName || "Agent";
+  const meta = document.createElement("p");
+  meta.className = "standup-detail-meta";
+  meta.textContent = `${kindLabel(post.kind)} · ${formatFeedTime(post.createdAt)}`;
+  standupDetail.append(name, meta);
+  if (post.title) {
+    const title = document.createElement("h2");
+    title.className = "standup-detail-title";
+    title.textContent = post.title;
+    standupDetail.appendChild(title);
+  }
+  const body = document.createElement("div");
+  body.className = "standup-detail-body";
+  const long = post.bodyLong || post.bodyShort || "";
+  if (typeof marked !== "undefined" && typeof DOMPurify !== "undefined") {
+    body.innerHTML = DOMPurify.sanitize(marked.parse(long));
+  } else {
+    body.textContent = long;
+  }
+  standupDetail.appendChild(body);
+  if (post.agentId && post.agentId !== "system") {
+    const open = document.createElement("button");
+    open.type = "button";
+    open.className = "activity-action primary";
+    open.textContent = `Open ${post.agentName}`;
+    open.style.marginTop = "16px";
+    open.onclick = () => {
+      closeAppPages();
+      setSelectedAgentId(post.agentId, { closeMenu: true });
+    };
+    standupDetail.appendChild(open);
   }
 }
 
 function jobCard(job) {
   const card = document.createElement("div");
-  card.className = "activity-card";
+  card.className = "job-card";
 
   const top = document.createElement("div");
-  top.className = "activity-card-top";
-  const title = document.createElement("div");
-  title.className = "activity-card-title";
-  const name = document.createElement("span");
-  name.className = "name";
-  name.textContent = job.agentLabel || job.agentId || "Main";
-  title.appendChild(name);
-  const pill = document.createElement("span");
-  pill.className = `activity-pill ${job.status || ""}`;
-  pill.textContent = jobStatusLabel(job);
-  top.append(title, pill);
-
-  const preview = document.createElement("div");
-  preview.className = "activity-preview";
-  preview.textContent = jobPreviewText(job);
-
-  card.append(top, preview);
+  top.className = "job-card-top";
+  const dot = document.createElement("span");
+  dot.className = `job-status-dot ${job.status || ""}`;
+  const copy = document.createElement("div");
+  copy.className = "job-card-copy";
+  const title = document.createElement("p");
+  title.className = "job-card-title";
+  title.textContent = jobPreviewText(job, 90) || "Job";
+  const meta = document.createElement("p");
+  meta.className = "job-card-meta";
+  const who = job.agentLabel || job.agentId || "Main";
+  meta.textContent = `${who} · ${jobStatusLabel(job)} · ${formatFeedTime(job.updatedAt || job.createdAt)}`;
+  copy.append(title, meta);
+  top.append(dot, copy);
+  card.appendChild(top);
 
   if (jobIsActive(job)) {
     const actions = document.createElement("div");
@@ -1365,6 +1787,7 @@ async function spawnAgentFromMenu() {
     }
     // Switch into the new agent session (its own empty chat history)
     if (j.agent?.id) {
+      closeAppPages();
       setSelectedAgentId(j.agent.id, { closeMenu: true });
     } else {
       updateMenuBadge();
@@ -1550,6 +1973,21 @@ if (activityClose) activityClose.onclick = () => closeActivityMenu();
 if (activityBackdrop) activityBackdrop.onclick = () => closeActivityMenu();
 if (activitySpawn) activitySpawn.onclick = () => void spawnAgentFromMenu();
 if (activityRefresh) activityRefresh.onclick = () => void refreshActivity({ force: true });
+if (navStandup) navStandup.onclick = () => void openStandupPage();
+if (navAgents) navAgents.onclick = () => openAgentsPage();
+if (navLoops) navLoops.onclick = () => void openLoopsPage();
+if (navJobs) navJobs.onclick = () => void openJobsPage();
+if (navSettings) navSettings.onclick = () => openSettingsPage();
+for (const btn of document.querySelectorAll("[data-close-page]")) {
+  btn.addEventListener("click", () => {
+    const target = btn.getAttribute("data-close-page");
+    if (target === "standup-detail" || target === "principles") {
+      showAppPage("standup");
+      return;
+    }
+    closeAppPages();
+  });
+}
 if (voiceTriggerSave) voiceTriggerSave.onclick = () => saveVoiceTriggerFromForm();
 if (voiceTriggerReset) voiceTriggerReset.onclick = () => resetVoiceTriggerForm();
 if (voiceTriggerInput) {
@@ -1567,9 +2005,20 @@ if (agentChip) agentChip.onclick = () => {
 };
 
 document.addEventListener("keydown", (e) => {
-  if (e.key === "Escape" && activityOpen) {
+  if (e.key !== "Escape") return;
+  if (activityOpen) {
     e.preventDefault();
     closeActivityMenu();
+    return;
+  }
+  if (openPageName === "standup-detail" || openPageName === "principles") {
+    e.preventDefault();
+    showAppPage("standup");
+    return;
+  }
+  if (openPageName) {
+    e.preventDefault();
+    closeAppPages();
   }
 });
 
@@ -1590,6 +2039,10 @@ async function checkStatus() {
       return false;
     }
     const j = await res.json();
+    if (typeof j.standupUnread === "number") {
+      standupUnread = j.standupUnread;
+      updateMenuBadge();
+    }
     freeHttpsMicUrl = buildFreeHttpsMicUrl(j, window.location);
     if (Array.isArray(j.agents)) {
       knownAgents = j.agents;
