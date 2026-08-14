@@ -80,9 +80,28 @@ test("client reloads host-backed conversation on unlock (not localStorage-only)"
   assert.match(appJs, /history-merge\.mjs/);
   assert.match(appJs, /reattachActiveJobs/);
   assert.match(appJs, /\.msg\.bot\[data-job-id/);
-  // showChat awaits host history before render
   assert.match(appJs, /await loadHostConversation|loadHostConversation\(\)/);
+  assert.match(appJs, /paintLocalChat/);
+  assert.match(appJs, /scheduleForegroundResume/);
+  assert.match(appJs, /shouldRefreshHostOnResume/);
+  assert.match(appJs, /historyFingerprint/);
   assert.match(serverJs, /handleConversation|\/api\/conversation/);
   assert.match(serverJs, /session\/load/);
   assert.match(serverJs, /preferredSessionId|phone-conversation/);
+});
+
+test("PWA first paint skips the gate when a secret is saved", () => {
+  const html = readFileSync(join(root, "public/index.html"), "utf8");
+  const css = readFileSync(join(root, "public/styles.css"), "utf8");
+  const sw = readFileSync(join(root, "public/sw.js"), "utf8");
+  assert.match(html, /has-secret/);
+  assert.match(html, /phone_chat_secret/);
+  assert.match(html, /apple-touch-startup-image/);
+  assert.match(html, /color-scheme" content="dark"/);
+  assert.match(css, /html\.has-secret #gate/);
+  assert.match(sw, /staleWhileRevalidate/);
+  assert.doesNotMatch(
+    sw,
+    /Network-first for app shell/
+  );
 });

@@ -6,6 +6,7 @@ import {
 import { buildThinkingHtml } from "./thinking-ui.mjs";
 import {
   normalizeSelectedAgentId,
+  shouldRefreshHostOnResume,
   agentStatusLine,
   agentDotKind,
   jobPreviewText,
@@ -101,6 +102,12 @@ const actionsBackdrop = $("actions-backdrop");
 const actionPhoto = $("action-photo");
 const actionTools = $("action-tools");
 const actionsCancel = $("actions-cancel");
+const queueSheet = $("queue-sheet");
+const queueBackdrop = $("queue-backdrop");
+const queueSendNowBtn = $("queue-send-now");
+const queueEditBtn = $("queue-edit");
+const queueDeleteBtn = $("queue-delete");
+const queueSheetCancel = $("queue-sheet-cancel");
 const dictationSheet = $("dictation-sheet");
 const dictationBackdrop = $("dictation-backdrop");
 const dictationKeyboardBtn = $("dictation-keyboard");
@@ -704,6 +711,227 @@ function attachJobIdToLatestPair(jobId) {
   persistHistory();
 }
 
+let queuedEditJobId = "";
+
+function findUserMsgEl(jobId) {
+  if (!jobId || !messages) return null;
+  const safe = String(jobId).replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+  return messages.querySelector(`.msg.user[data-job-id="${safe}"]`);
+}
+
+function updateHistoryUserText(jobId, text) {
+  for (let i = history.length - 1; i >= 0; i--) {
+    if (history[i].role === "user" && history[i].jobId === jobId) {
+      history[i].text = text;
+      persistHistory();
+      return;
+    }
+  }
+}
+
+function removeHistoryForJob(jobId) {
+  history = history.filter((m) => m.jobId !== jobId);
+  persistHistory();
+}
+
+function clearQueuedEditMode() {
+  queuedEditJobId = "";
+  if (sendBtn) sendBtn.setAttribute("aria-label", "Send");
+  setDictationHint("");
+}
+
+const QUEUE_LONG_PRESS_MS = 480;
+let queueSheetJobId = "";
+
+function closeQueueSheet() {
+  queueSheetJobId = "";
+  if (!queueSheet) return;
+  queueSheet.classList.add("hidden");
+  queueSheet.setAttribute("aria-hidden", "true");
+}
+
+function openQueueSheet(jobId) {
+  if (!jobId || !queueSheet) return;
+  queueSheetJobId = jobId;
+  queueSheet.classList.remove("hidden");
+  queueSheet.setAttribute("aria-hidden", "false");
+  try {
+    navigator.vibrate?.(12);
+  } catch {
+    /* ignore */
+  }
+}
+
+function bindQueuedLongPress(userEl) {
+  if (!userEl || userEl.dataset.queueBound === "1") return;
+  userEl.dataset.queueBound = "1";
+  let timer = 0;
+  let startX = 0;
+  let startY = 0;
+  const clearTimer = () => {
+    if (timer) {
+      clearTimeout(timer);
+      timer = 0;
+    }
+  };
+  const fire = () => {
+    const id = userEl.dataset.jobId;
+    if (id) openQueueSheet(id);
+  };
+  const start = (e) => {
+    if (userEl.dataset.queued !== "1") return;
+    if (e.pointerType === "mouse" && e.button !== 0) return;
+    startX = e.clientX;
+    startY = e.clientY;
+    clearTimer();
+    timer = window.setTimeout(() => {
+      timer = 0;
+      fire();
+    }, QUEUE_LONG_PRESS_MS);
+  };
+  const move = (e) => {
+    if (!timer) return;
+    if (Math.hypot(e.clientX - startX, e.clientY - startY) > 12) clearTimer();
+  };
+  userEl.addEventListener("pointerdown", start);
+  userEl.addEventListener("pointermove", move);
+  userEl.addEventListener("pointerup", clearTimer);
+  userEl.addEventListener("pointercancel", clearTimer);
+  userEl.addEventListener("contextmenu", (e) => {
+    if (userEl.dataset.queued !== "1") return;
+    e.preventDefault();
+    clearTimer();
+    fire();
+  });
+}
+
+function syncQueuedMsgActions(jobId, jobStatus) {
+  const userEl = findUserMsgEl(jobId);
+  if (!userEl) return;
+  if (jobStatus !== "queued") {
+    userEl.dataset.queued = "0";
+    userEl.classList.remove("queued-msg");
+    if (queuedEditJobId === jobId) clearQueuedEditMode();
+    if (queueSheetJobId === jobId) closeQueueSheet();
+    return;
+  }
+  userEl.dataset.queued = "1";
+  userEl.classList.add("queued-msg");
+  bindQueuedLongPress(userEl);
+}
+
+function beginQueuedEdit(jobId, fallbackText = "") {
+  if (!jobId || !input) return;
+  const fromHist = history.find((m) => m.role === "user" && m.jobId === jobId);
+  const body = findUserMsgEl(jobId)?.querySelector(".body");
+  const text = (fromHist?.text || body?.innerText || fallbackText || "").trim();
+  queuedEditJobId = jobId;
+  input.value = text;
+  input.style.height = "auto";
+  input.style.height = `${Math.min(input.scrollHeight, 160)}px`;
+  input.focus();
+  if (sendBtn) sendBtn.setAttribute("aria-label", "Save edit");
+  setDictationHint("Editing queued message — tap ↑ to save, Esc to cancel.");
+  closeQueueSheet();
+  closeAppPages();
+}
+
+async function saveQueuedEdit() {
+  const jobId = queuedEditJobId;
+  const text = input.value.trim();
+  const secret = getSecret();
+  if (!jobId || !secret) return;
+  if (!text) {
+    setDictationHint("Queued message can’t be empty.");
+    return;
+  }
+  try {
+    const res = await fetch(`/api/jobs/${encodeURIComponent(jobId)}`, {
+      method: "PATCH",
+      headers: {
+        Authorization: `Bearer ${secret}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ text }),
+    });
+    const j = await res.json().catch(() => ({}));
+    if (res.status === 409) {
+      setDictationHint("That message already started — can’t edit it.");
+      clearQueuedEditMode();
+      return;
+    }
+    if (!res.ok) throw new Error(j.error || res.statusText);
+    const userEl = findUserMsgEl(jobId);
+    const body = userEl?.querySelector(".body");
+    if (body) setBodyContent(body, text, "user");
+    updateHistoryUserText(jobId, text);
+    input.value = "";
+    input.style.height = "auto";
+    clearQueuedEditMode();
+    void refreshActivity({ quiet: true });
+  } catch (e) {
+    setDictationHint(`Could not save edit: ${e.message || e}`);
+  }
+}
+
+async function sendQueuedMessageNow(jobId) {
+  const secret = getSecret();
+  if (!secret || !jobId) return;
+  closeQueueSheet();
+  try {
+    const res = await fetch(`/api/jobs/${encodeURIComponent(jobId)}/now`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${secret}` },
+    });
+    const j = await res.json().catch(() => ({}));
+    if (res.status === 409) {
+      setDictationHint("That message already started.");
+      syncQueuedMsgActions(jobId, "running");
+      return;
+    }
+    if (!res.ok) throw new Error(j.error || res.statusText);
+    const pos = j.queuePosition || 1;
+    setDictationHint(
+      pos <= 1 ? "Next up — sending as soon as the Mac is free." : `Moved up to #${pos}.`
+    );
+    void refreshActivity({ quiet: true });
+  } catch (e) {
+    setDictationHint(`Could not send now: ${e.message || e}`);
+  }
+}
+
+async function deleteQueuedMessage(jobId, opts = {}) {
+  const secret = getSecret();
+  if (!secret || !jobId) return;
+  if (!opts.skipConfirm && !confirm("Delete this queued message?")) return;
+  closeQueueSheet();
+  try {
+    const res = await fetch(`/api/jobs/${encodeURIComponent(jobId)}`, {
+      method: "DELETE",
+      headers: { Authorization: `Bearer ${secret}` },
+    });
+    const j = await res.json().catch(() => ({}));
+    if (res.status === 409) {
+      setDictationHint("That message already started — stop it from Jobs.");
+      syncQueuedMsgActions(jobId, "running");
+      return;
+    }
+    if (!res.ok) throw new Error(j.error || res.statusText);
+    stopJobPoll(jobId);
+    findUserMsgEl(jobId)?.remove();
+    findBotMsgEl(jobId)?.remove();
+    removeHistoryForJob(jobId);
+    if (queuedEditJobId === jobId) {
+      input.value = "";
+      input.style.height = "auto";
+      clearQueuedEditMode();
+    }
+    void refreshActivity({ quiet: true });
+  } catch (e) {
+    setDictationHint(`Could not delete: ${e.message || e}`);
+  }
+}
+
 function renderHistory() {
   messages.innerHTML = "";
   // stop old polls
@@ -748,6 +976,11 @@ function renderHistory() {
       m.jobStatus !== "cancelled"
     ) {
       startJobPoll(m.jobId, body, thinkingEl);
+    }
+    if (m.role === "user" && m.jobId) {
+      const pair = history.find((h) => h.role === "bot" && h.jobId === m.jobId);
+      const st = m.jobStatus || pair?.jobStatus;
+      if (st === "queued") syncQueuedMsgActions(m.jobId, "queued");
     }
   }
   scrollBottom({ force: true });
@@ -831,6 +1064,7 @@ function startJobPoll(jobId, bodyEl, thinkingEl) {
     if (closed || !job) return;
     const reallyQueued =
       job.status === "queued" && (job.queuePosition || 0) > 0;
+    syncQueuedMsgActions(jobId, reallyQueued ? "queued" : job.status);
     const { toolsLine, reply } = applyJobToUi(job);
 
     if (
@@ -977,6 +1211,12 @@ function stopJobPoll(jobId) {
   activePolls.delete(jobId);
 }
 
+function historyFingerprint(list) {
+  const h = Array.isArray(list) ? list : [];
+  const last = h[h.length - 1] || {};
+  return `${h.length}:${last.jobId || ""}:${last.jobStatus || ""}:${String(last.text || "").length}`;
+}
+
 // Resume polls + refresh host transcript when phone unlocks / tab visible
 async function onForegroundResume() {
   try {
@@ -984,14 +1224,9 @@ async function onForegroundResume() {
     if (host) {
       if (Array.isArray(host.activeJobs)) knownJobs = host.activeJobs;
       if (Array.isArray(host.agents)) knownAgents = host.agents;
-      const prevLen = history.length;
-      const prevId = getStoredConversationId();
+      const before = historyFingerprint(history);
       applyHostConversation(host);
-      if (
-        history.length !== prevLen ||
-        host.conversationId !== prevId ||
-        (host.messages || []).length !== prevLen
-      ) {
+      if (historyFingerprint(history) !== before) {
         renderHistory();
       }
       reattachActiveJobs(jobsForSelectedAgent(host.activeJobs || knownJobs));
@@ -1007,13 +1242,40 @@ async function onForegroundResume() {
   checkStatus();
 }
 
-document.addEventListener("visibilitychange", () => {
-  if (document.visibilityState === "visible") {
+let resumeTimer = 0;
+let lastResumeAt = 0;
+let hiddenAt = 0;
+let lastHiddenMs = 0;
+
+function scheduleForegroundResume() {
+  if (hiddenAt) {
+    lastHiddenMs = Date.now() - hiddenAt;
+    hiddenAt = 0;
+  }
+  if (!shouldRefreshHostOnResume(lastHiddenMs)) return;
+  const now = Date.now();
+  if (now - lastResumeAt < 1200) return;
+  clearTimeout(resumeTimer);
+  resumeTimer = window.setTimeout(() => {
+    lastResumeAt = Date.now();
     void onForegroundResume();
+  }, 80);
+}
+
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "hidden") {
+    hiddenAt = Date.now();
+    return;
+  }
+  if (document.visibilityState === "visible") {
+    scheduleForegroundResume();
   }
 });
 window.addEventListener("focus", () => {
-  void onForegroundResume();
+  scheduleForegroundResume();
+});
+window.addEventListener("pageshow", (e) => {
+  if (e.persisted) scheduleForegroundResume();
 });
 
 function renderPreviews() {
@@ -1731,7 +1993,27 @@ function jobCard(job) {
   top.append(dot, copy);
   card.appendChild(top);
 
-  if (jobIsActive(job)) {
+  if (job.status === "queued") {
+    const actions = document.createElement("div");
+    actions.className = "activity-actions";
+    const now = document.createElement("button");
+    now.type = "button";
+    now.className = "activity-action primary";
+    now.textContent = "Send now";
+    now.onclick = () => void sendQueuedMessageNow(job.id);
+    const edit = document.createElement("button");
+    edit.type = "button";
+    edit.className = "activity-action";
+    edit.textContent = "Edit";
+    edit.onclick = () => beginQueuedEdit(job.id, job.text || "");
+    const del = document.createElement("button");
+    del.type = "button";
+    del.className = "activity-action danger";
+    del.textContent = "Delete";
+    del.onclick = () => void deleteQueuedMessage(job.id);
+    actions.append(now, edit, del);
+    card.appendChild(actions);
+  } else if (jobIsActive(job)) {
     const actions = document.createElement("div");
     actions.className = "activity-actions";
 
@@ -2022,9 +2304,13 @@ document.addEventListener("keydown", (e) => {
   }
 });
 
+/** @type {"ok"|"auth"|"offline"|"locked"} */
+let lastStatusKind = "locked";
+
 async function checkStatus() {
   const secret = getSecret();
   if (!secret) {
+    lastStatusKind = "locked";
     setConn("locked", "bad");
     stopActivityPoll();
     return false;
@@ -2034,7 +2320,9 @@ async function checkStatus() {
       headers: { Authorization: `Bearer ${secret}` },
     });
     if (!res.ok) {
-      setConn("auth failed", "bad");
+      lastStatusKind =
+        res.status === 401 || res.status === 403 ? "auth" : "offline";
+      setConn(lastStatusKind === "auth" ? "auth failed" : "offline", "bad");
       stopActivityPoll();
       return false;
     }
@@ -2050,10 +2338,12 @@ async function checkStatus() {
       updateAgentChip();
       updateMenuBadge();
     }
+    lastStatusKind = "ok";
     setConn(j.agentReady ? "connected" : "starting…", j.agentReady ? "ok" : "");
     startActivityPoll();
     return true;
   } catch {
+    lastStatusKind = "offline";
     setConn("offline", "bad");
     stopActivityPoll();
     return false;
@@ -2153,9 +2443,20 @@ function applyHostConversation(host) {
   persistHistory("main");
 }
 
-async function showChat() {
+function paintLocalChat() {
+  document.documentElement.classList.add("has-secret");
   gate.classList.add("hidden");
   chat.classList.add("active");
+  history = loadHistory(selectedAgentId);
+  renderHistory();
+  updateAgentChip();
+}
+
+async function showChat() {
+  document.documentElement.classList.add("has-secret");
+  gate.classList.add("hidden");
+  chat.classList.add("active");
+  const before = historyFingerprint(history);
   // Host-backed history first for main; extras use per-agent localStorage
   const host = await loadHostConversation();
   if (Array.isArray(host?.agents)) {
@@ -2168,8 +2469,10 @@ async function showChat() {
     knownJobs = host.activeJobs;
   }
   if (host) applyHostConversation(host);
-  else history = loadHistory();
-  renderHistory();
+  else if (!history.length) history = loadHistory();
+  if (historyFingerprint(history) !== before) {
+    renderHistory();
+  }
   reattachActiveJobs(
     (host?.activeJobs || []).filter(
       (j) =>
@@ -2182,6 +2485,7 @@ async function showChat() {
 }
 
 function showGate() {
+  document.documentElement.classList.remove("has-secret");
   chat.classList.remove("active");
   gate.classList.remove("hidden");
   stopActivityPoll();
@@ -3231,6 +3535,28 @@ if (actionsBtn) {
     }
   };
 }
+if (queueBackdrop) queueBackdrop.onclick = () => closeQueueSheet();
+if (queueSheetCancel) queueSheetCancel.onclick = () => closeQueueSheet();
+if (queueSendNowBtn) {
+  queueSendNowBtn.onclick = () => {
+    const id = queueSheetJobId;
+    if (id) void sendQueuedMessageNow(id);
+  };
+}
+if (queueEditBtn) {
+  queueEditBtn.onclick = () => {
+    const id = queueSheetJobId;
+    closeQueueSheet();
+    if (id) beginQueuedEdit(id);
+  };
+}
+if (queueDeleteBtn) {
+  queueDeleteBtn.onclick = () => {
+    const id = queueSheetJobId;
+    if (id) void deleteQueuedMessage(id, { skipConfirm: true });
+  };
+}
+
 if (actionsBackdrop) actionsBackdrop.onclick = () => closeActionsSheet();
 if (actionsCancel) actionsCancel.onclick = () => closeActionsSheet();
 if (actionPhoto) {
@@ -3410,6 +3736,10 @@ input.addEventListener("keydown", (e) => {
  * You can send many in a row (queue). Phone lock won't cancel Mac work.
  */
 async function send() {
+  if (queuedEditJobId) {
+    await saveQueuedEdit();
+    return;
+  }
   const text = input.value.trim();
   if (!text && !pendingImages.length) return;
   const secret = getSecret();
@@ -3487,13 +3817,18 @@ async function send() {
     });
     attachJobIdToLatestPair(jobId);
     for (let i = history.length - 1; i >= 0; i--) {
-      if (history[i].role === "bot" && history[i].jobId === jobId) {
-        history[i].jobStatus = isQueued ? "queued" : "running";
-        if (!history[i].text) history[i].text = "";
-        persistHistory();
-        break;
+      if (history[i].jobId === jobId) {
+        if (history[i].role === "bot") {
+          history[i].jobStatus = isQueued ? "queued" : "running";
+          if (!history[i].text) history[i].text = "";
+        }
+        if (history[i].role === "user") {
+          history[i].jobStatus = isQueued ? "queued" : "running";
+        }
       }
     }
+    persistHistory();
+    if (isQueued) syncQueuedMsgActions(jobId, "queued");
     const botEl = body.closest(".msg");
     if (botEl) {
       botEl.dataset.jobId = jobId;
@@ -3528,6 +3863,13 @@ sendBtn.onclick = () => {
 
 // Enter to send when slash menu closed (menu handler runs first for pick)
 input.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && queuedEditJobId) {
+    e.preventDefault();
+    input.value = "";
+    input.style.height = "auto";
+    clearQueuedEditMode();
+    return;
+  }
   if (e.key === "Enter" && !e.shiftKey && slashMenu.classList.contains("hidden")) {
     e.preventDefault();
     void send();
@@ -3598,14 +3940,20 @@ if ("serviceWorker" in navigator) {
 }
 if (getSecret()) {
   secretInput.value = getSecret();
-  checkStatus().then(async (ok) => {
+  paintLocalChat();
+  setConn("connecting…", "");
+  void (async () => {
+    const ok = await checkStatus();
+    if (!ok && lastStatusKind === "auth") {
+      showGate();
+      return;
+    }
     if (ok) {
       await loadTools();
       await showChat();
-      // Free HTTPS landing with ?automic=1 → start recording immediately
       await maybeAutoStartMicFromQuery();
     }
-  });
+  })();
 } else {
   setConn("locked", "bad");
 }

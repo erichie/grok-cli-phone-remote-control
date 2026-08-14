@@ -47,12 +47,16 @@ import {
   sealJob,
   isShortFollowUp,
   buildRecentContextBlock,
+  isQueuedWaitingJob,
+  applyQueuedJobText,
+  promoteQueuedJob,
 } from "./lib/job-ownership.mjs";
 import {
   emptyConversation,
   loadConversation,
   saveConversation,
   upsertJobInConversation,
+  removeJobFromConversation,
   jobBelongsToMainConversation,
   isMainAgentId,
   conversationToMessages,
@@ -2040,6 +2044,106 @@ async function finalizeJob(id) {
   return job;
 }
 
+async function editQueuedJob(id, text) {
+  const job = await loadJob(id);
+  if (!job) return { code: 404, error: "job not found" };
+  const slot = slotFor(job.agentId || "main");
+  if (
+    !isQueuedWaitingJob(job, slot.currentJobId) ||
+    !slot.jobQueue.includes(id)
+  ) {
+    return { code: 409, error: "job is no longer queued" };
+  }
+  try {
+    applyQueuedJobText(job, text);
+  } catch (e) {
+    return {
+      code: 400,
+      error: e instanceof Error ? e.message : String(e),
+    };
+  }
+  await persistJob(job);
+  return { code: 200, job };
+}
+
+async function deleteQueuedJob(id) {
+  const job = await loadJob(id);
+  if (!job) return { code: 404, error: "job not found" };
+  const slot = slotFor(job.agentId || "main");
+  if (
+    !isQueuedWaitingJob(job, slot.currentJobId) ||
+    !slot.jobQueue.includes(id)
+  ) {
+    return { code: 409, error: "job is no longer queued" };
+  }
+  const idx = slot.jobQueue.indexOf(id);
+  if (idx >= 0) slot.jobQueue.splice(idx, 1);
+  const pending = persistChains.get(id);
+  if (pending) await pending.catch(() => {});
+  jobs.delete(id);
+  try {
+    await unlink(jobPath(id));
+  } catch {
+    /* already gone */
+  }
+  if (jobBelongsToMainConversation(job)) {
+    conversation = removeJobFromConversation(conversation, id);
+    await persistConversation();
+  }
+  return { code: 200, deleted: true, id };
+}
+
+async function handleJobPatch(req, res, id) {
+  if (!authOk(req)) return sendJson(res, 401, { error: "unauthorized" });
+  let body = {};
+  try {
+    const raw = (await readBody(req)).toString("utf8");
+    if (raw.trim()) body = JSON.parse(raw);
+  } catch {
+    return sendJson(res, 400, { error: "invalid json" });
+  }
+  const result = await editQueuedJob(id, body.text);
+  if (result.code !== 200) {
+    return sendJson(res, result.code, { error: result.error });
+  }
+  sendJson(res, 200, publicJob(result.job));
+}
+
+async function sendQueuedJobNow(id) {
+  const job = await loadJob(id);
+  if (!job) return { code: 404, error: "job not found" };
+  const slot = slotFor(job.agentId || "main");
+  if (
+    !isQueuedWaitingJob(job, slot.currentJobId) ||
+    !slot.jobQueue.includes(id)
+  ) {
+    return { code: 409, error: "job is no longer queued" };
+  }
+  promoteQueuedJob(slot.jobQueue, id);
+  job.updatedAt = new Date().toISOString();
+  await persistJob(job);
+  if (!slot.queueRunning) void processQueue(slot.id);
+  return { code: 200, job };
+}
+
+async function handleJobSendNow(req, res, id) {
+  if (!authOk(req)) return sendJson(res, 401, { error: "unauthorized" });
+  const result = await sendQueuedJobNow(id);
+  if (result.code !== 200) {
+    return sendJson(res, result.code, { error: result.error });
+  }
+  sendJson(res, 200, publicJob(result.job));
+}
+
+async function handleJobDelete(req, res, id) {
+  if (!authOk(req)) return sendJson(res, 401, { error: "unauthorized" });
+  const result = await deleteQueuedJob(id);
+  if (result.code !== 200) {
+    return sendJson(res, result.code, { error: result.error });
+  }
+  sendJson(res, 200, { deleted: true, id: result.id });
+}
+
 async function cancelJob(id) {
   const job = await loadJob(id);
   if (!job) return null;
@@ -3319,6 +3423,10 @@ async function onRequest(req, res) {
     if (req.method === "GET" && pathOnly === "/api/jobs") {
       return await handleJobsList(req, res);
     }
+    const jobNow = pathOnly.match(/^\/api\/jobs\/([a-f0-9-]+)\/now$/i);
+    if (req.method === "POST" && jobNow) {
+      return await handleJobSendNow(req, res, jobNow[1]);
+    }
     const jobCancel = pathOnly.match(
       /^\/api\/jobs\/([a-f0-9-]+)\/cancel$/i
     );
@@ -3346,6 +3454,12 @@ async function onRequest(req, res) {
     const jobMatch = pathOnly.match(/^\/api\/jobs\/([a-f0-9-]+)$/i);
     if (req.method === "GET" && jobMatch) {
       return await handleJobGet(req, res, jobMatch[1]);
+    }
+    if (req.method === "PATCH" && jobMatch) {
+      return await handleJobPatch(req, res, jobMatch[1]);
+    }
+    if (req.method === "DELETE" && jobMatch) {
+      return await handleJobDelete(req, res, jobMatch[1]);
     }
     return serveStatic(req, res);
   } catch (e) {

@@ -5,6 +5,8 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   normalizeSelectedAgentId,
+  shouldRefreshHostOnResume,
+  SHORT_BACKGROUND_MS,
   agentStatusLine,
   agentDotKind,
   jobPreviewText,
@@ -42,6 +44,19 @@ test("normalizeSelectedAgentId falls back to main when missing", () => {
   assert.equal(normalizeSelectedAgentId(agents, "aaaa-bbbb"), "aaaa-bbbb");
   assert.equal(normalizeSelectedAgentId(agents, "auto"), "auto");
   assert.equal(normalizeSelectedAgentId(agents, ""), "main");
+});
+
+test("shouldRefreshHostOnResume skips brief background hops", () => {
+  assert.equal(shouldRefreshHostOnResume(800), false);
+  assert.equal(shouldRefreshHostOnResume(1000), false);
+  assert.equal(shouldRefreshHostOnResume(SHORT_BACKGROUND_MS), true);
+  assert.equal(shouldRefreshHostOnResume(30_000), true);
+  assert.equal(shouldRefreshHostOnResume(null), true);
+});
+
+test("normalizeSelectedAgentId keeps saved id until the roster loads", () => {
+  assert.equal(normalizeSelectedAgentId([], "aaaa-bbbb"), "aaaa-bbbb");
+  assert.equal(normalizeSelectedAgentId(null, "aaaa-bbbb"), "aaaa-bbbb");
 });
 
 test("agentStatusLine and agentDotKind reflect busy/idle/stopped", () => {

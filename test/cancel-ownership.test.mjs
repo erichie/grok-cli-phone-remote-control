@@ -4,6 +4,9 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { join, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   createJob,
   applySessionUpdate,
@@ -15,6 +18,9 @@ import {
   sealJob,
   isShortFollowUp,
   buildRecentContextBlock,
+  isQueuedWaitingJob,
+  applyQueuedJobText,
+  promoteQueuedJob,
 } from "../lib/job-ownership.mjs";
 
 /**
@@ -104,6 +110,41 @@ test("without seal, cancelled can be overwritten (documents the old bug)", () =>
   assert.equal(job.status, "cancelled");
 });
 
+test("isQueuedWaitingJob is only true for waiting queued jobs", () => {
+  assert.equal(
+    isQueuedWaitingJob({ id: "q1", status: "queued" }, null),
+    true
+  );
+  assert.equal(
+    isQueuedWaitingJob({ id: "q1", status: "queued" }, "q1"),
+    false
+  );
+  assert.equal(
+    isQueuedWaitingJob({ id: "q1", status: "running" }, null),
+    false
+  );
+  assert.equal(
+    isQueuedWaitingJob({ id: "q1", status: "queued", userFinalized: true }, null),
+    false
+  );
+});
+
+test("promoteQueuedJob moves an id to the front", () => {
+  const q = ["a", "b", "c"];
+  assert.equal(promoteQueuedJob(q, "c"), true);
+  assert.deepEqual(q, ["c", "a", "b"]);
+  assert.equal(promoteQueuedJob(q, "c"), true);
+  assert.deepEqual(q, ["c", "a", "b"]);
+  assert.equal(promoteQueuedJob(q, "missing"), false);
+});
+
+test("applyQueuedJobText updates text and rejects empty", () => {
+  const job = createJob({ id: "q1", status: "queued", text: "old" });
+  applyQueuedJobText(job, "  new ask  ");
+  assert.equal(job.text, "new ask");
+  assert.throws(() => applyQueuedJobText(job, "   "), /text is required/);
+});
+
 test("isShortFollowUp detects yes-please style confirmations", () => {
   assert.equal(isShortFollowUp("Yes please"), true);
   assert.equal(isShortFollowUp("ok"), true);
@@ -114,6 +155,26 @@ test("isShortFollowUp detects yes-please style confirmations", () => {
     false
   );
   assert.equal(isShortFollowUp(""), false);
+});
+
+test("server and client expose queued edit/delete", () => {
+  const root = join(dirname(fileURLToPath(import.meta.url)), "..");
+  const serverJs = readFileSync(join(root, "server.mjs"), "utf8");
+  const appJs = readFileSync(join(root, "public/app.js"), "utf8");
+  assert.match(serverJs, /handleJobPatch/);
+  assert.match(serverJs, /handleJobDelete/);
+  assert.match(serverJs, /handleJobSendNow/);
+  assert.match(serverJs, /editQueuedJob/);
+  assert.match(appJs, /syncQueuedMsgActions/);
+  assert.match(appJs, /bindQueuedLongPress/);
+  assert.match(appJs, /QUEUE_LONG_PRESS_MS/);
+  assert.match(appJs, /saveQueuedEdit/);
+  assert.match(appJs, /sendQueuedMessageNow/);
+  assert.match(appJs, /deleteQueuedMessage/);
+  const html = readFileSync(join(root, "public/index.html"), "utf8");
+  assert.match(html, /id="queue-sheet"/);
+  assert.match(html, /id="queue-send-now"/);
+  assert.doesNotMatch(appJs, /className = "queue-actions"/);
 });
 
 test("buildRecentContextBlock includes prior Q/A for cold sessions", () => {

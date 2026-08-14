@@ -12,6 +12,7 @@ import {
   loadConversation,
   saveConversation,
   upsertJobInConversation,
+  removeJobFromConversation,
   conversationToMessages,
   rebuildConversationFromJobs,
   buildTranscriptPromptContext,
@@ -160,6 +161,21 @@ test("rebuildConversationFromJobs recovers text from job files only", async () =
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+test("removeJobFromConversation drops both turns for a job", () => {
+  let state = emptyConversation("conv-del");
+  state = upsertJobInConversation(state, {
+    id: "q-del",
+    status: "queued",
+    text: "do the thing",
+    reply: "",
+    createdAt: "2026-08-13T12:00:00.000Z",
+    updatedAt: "2026-08-13T12:00:00.000Z",
+  });
+  assert.equal(state.turns.length, 2);
+  state = removeJobFromConversation(state, "q-del");
+  assert.equal(state.turns.length, 0);
 });
 
 test("isMainAgentId treats missing/default/auto as main", () => {

@@ -37,10 +37,25 @@
  * @param {string} selectedId
  * @returns {string}
  */
+/** Host conversation refetch after this long in the background. */
+export const SHORT_BACKGROUND_MS = 10_000;
+
+/**
+ * True when a resume should pull the Mac transcript.
+ * Brief app-switcher hops must not freeze the UI.
+ * @param {number|null|undefined} hiddenMs
+ */
+export function shouldRefreshHostOnResume(hiddenMs) {
+  if (hiddenMs == null || !Number.isFinite(Number(hiddenMs))) return true;
+  return Number(hiddenMs) >= SHORT_BACKGROUND_MS;
+}
+
 export function normalizeSelectedAgentId(agents, selectedId) {
   const list = Array.isArray(agents) ? agents : [];
   if (!selectedId || selectedId === "auto") return selectedId || "main";
   if (selectedId === "default") return "main";
+  // Empty roster = not loaded yet. Keep the saved id so resume doesn't snap to Main.
+  if (!list.length) return selectedId;
   if (list.some((a) => a.id === selectedId)) return selectedId;
   return "main";
 }

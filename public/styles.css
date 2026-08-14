@@ -193,6 +193,14 @@ header .status.bad {
   opacity: 0.7;
 }
 
+/* Saved secret: first paint is chat, not the unlock gate (iOS PWA resume). */
+html.has-secret #gate {
+  display: none !important;
+}
+html.has-secret #chat {
+  display: flex;
+}
+
 /* ── Gate ───────────────────────────────────────────────── */
 #gate {
   flex: 1;
@@ -335,6 +343,12 @@ header .status.bad {
 
 .msg.user .body {
   white-space: pre-wrap;
+}
+
+.msg.user.queued-msg {
+  -webkit-touch-callout: none;
+  -webkit-user-select: none;
+  user-select: none;
 }
 
 /* Grok: full width, no bubble — document-style */
@@ -979,6 +993,10 @@ header .status.bad {
 
 .sheet-btn:active {
   background: #1c1c1c;
+}
+
+.sheet-btn-danger {
+  color: #f0c0c0;
 }
 
 .sheet-cancel {

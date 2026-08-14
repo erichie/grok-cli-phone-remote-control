@@ -94,7 +94,7 @@ Hamburger is circular icon buttons. Chat stays home.
 | Standup | Daily paper: goal pin + English loop posts. Opening marks read. Badge includes unread. |
 | Agents | Spawn / rename / stop concurrent Mac processes. Header **To** chip still cycles send target. |
 | Loops | Catalog + next run + last run. Specialists write briefs; a synth reads them. **Run now** or the Mac ticker. |
-| Jobs | Queue recovery (Stop & show / Cancel). Not in the top bar. |
+| Jobs | Queue recovery. Queued: Send now / Edit / Delete (chat: long-press the bubble). Running: Stop & show / Cancel. |
 | Settings | Spoken send phrase (`localStorage` on that phone). |
 
 Full tables and curl: repo `README.md` → **Standup, loops, and pages**.
