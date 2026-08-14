@@ -129,6 +129,7 @@ const SEND_TRIGGER_KEY = "phone_chat_send_triggers";
 const HISTORY_KEY = "phone_chat_history_v1";
 const CONVERSATION_ID_KEY = "phone_chat_conversation_id";
 const SELECTED_AGENT_KEY = "phone_chat_selected_agent";
+const AGENT_SEEN_KEY = "phone_chat_agent_seen_v1";
 const MAX_HISTORY = 80;
 /** Cap total stored image data (~2MB JSON safety for localStorage) */
 const MAX_IMAGE_CHARS = 1_800_000;
@@ -149,6 +150,8 @@ let knownJobs = [];
 /** Selected session / send target: "main" | agent uuid (not "auto" for history) */
 let selectedAgentId =
   localStorage.getItem(SELECTED_AGENT_KEY) || "main";
+/** agentId → last time the user opened that chat (ms). */
+let lastSeenByAgent = loadAgentSeen();
 /** @type {ReturnType<typeof setInterval> | null} */
 let activityPollTimer = null;
 let activityOpen = false;
@@ -191,6 +194,41 @@ function migrateLegacyHistory() {
   }
 }
 migrateLegacyHistory();
+
+function loadAgentSeen() {
+  try {
+    const raw = localStorage.getItem(AGENT_SEEN_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function persistAgentSeen() {
+  try {
+    localStorage.setItem(AGENT_SEEN_KEY, JSON.stringify(lastSeenByAgent));
+  } catch {
+    /* ignore */
+  }
+}
+
+function markAgentSeen(agentId, at = Date.now()) {
+  const id = historyAgentId(agentId);
+  const prev = Number(lastSeenByAgent[id] || 0);
+  if (at <= prev) return;
+  lastSeenByAgent[id] = at;
+  persistAgentSeen();
+}
+
+/** First time we learn an agent exists, don't replay old jobs as unread. */
+function seedAgentSeen(agentId, at = Date.now()) {
+  const id = historyAgentId(agentId);
+  if (lastSeenByAgent[id] != null) return;
+  lastSeenByAgent[id] = at;
+  persistAgentSeen();
+}
 
 function getStoredConversationId(agentId = selectedAgentId) {
   try {
@@ -1072,6 +1110,11 @@ function startJobPoll(jobId, bodyEl, thinkingEl) {
       job.status === "error" ||
       job.status === "cancelled"
     ) {
+      if (
+        historyAgentId(job.agentId || "main") === historyAgentId(selectedAgentId)
+      ) {
+        markAgentSeen(selectedAgentId);
+      }
       const replyLen = (reply || "").length;
       const grew = replyLen > lastReplyLen;
       lastReplyLen = replyLen;
@@ -1337,6 +1380,7 @@ function setSelectedAgentId(id, opts = {}) {
   clearHeaderJobActions();
 
   selectedAgentId = next;
+  markAgentSeen(next);
   try {
     localStorage.setItem(SELECTED_AGENT_KEY, selectedAgentId);
   } catch {
@@ -1378,6 +1422,7 @@ function updateMenuBadge() {
   // (not while working, not "you have N agents")
   const ready = activityBadgeCount(knownJobs, knownAgents, {
     selectedAgentId: historyAgentId(selectedAgentId),
+    lastSeenByAgent,
   });
   const n = combineMenuBadge(ready, standupUnread);
   if (standupNavBadge) {
@@ -1456,6 +1501,10 @@ async function refreshActivity(opts = {}) {
     const j = await res.json();
     knownJobs = Array.isArray(j.jobs) ? j.jobs : [];
     knownAgents = Array.isArray(j.agents) ? j.agents : knownAgents;
+    for (const a of knownAgents) {
+      if (a?.id) seedAgentSeen(a.id);
+    }
+    markAgentSeen(selectedAgentId);
     if (typeof j.standupUnread === "number") standupUnread = j.standupUnread;
     const nextSel = historyAgentId(
       normalizeSelectedAgentId(knownAgents, selectedAgentId)
@@ -1532,6 +1581,16 @@ function renderActivityAgents() {
       const pill = document.createElement("span");
       pill.className = "activity-pill running";
       pill.textContent = "Current";
+      top.appendChild(pill);
+    } else if (
+      activityBadgeCount(knownJobs, [agent], {
+        selectedAgentId: currentId,
+        lastSeenByAgent,
+      }) > 0
+    ) {
+      const pill = document.createElement("span");
+      pill.className = "activity-pill unread";
+      pill.textContent = "New";
       top.appendChild(pill);
     }
 
@@ -2335,6 +2394,10 @@ async function checkStatus() {
     if (Array.isArray(j.agents)) {
       knownAgents = j.agents;
       selectedAgentId = normalizeSelectedAgentId(knownAgents, selectedAgentId);
+      for (const a of knownAgents) {
+        if (a?.id) seedAgentSeen(a.id);
+      }
+      markAgentSeen(selectedAgentId);
       updateAgentChip();
       updateMenuBadge();
     }
@@ -2448,6 +2511,7 @@ function paintLocalChat() {
   gate.classList.add("hidden");
   chat.classList.add("active");
   history = loadHistory(selectedAgentId);
+  markAgentSeen(selectedAgentId);
   renderHistory();
   updateAgentChip();
 }

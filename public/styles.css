@@ -1962,6 +1962,12 @@ html.has-secret #chat {
   border-color: #3a3a3a;
 }
 
+.activity-pill.unread {
+  color: #111;
+  background: #fff;
+  border-color: #fff;
+}
+
 .activity-pill.error {
   color: #aaa;
 }

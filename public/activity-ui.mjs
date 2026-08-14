@@ -203,6 +203,9 @@ export function activityBadgeCount(jobs, agents, opts = {}) {
   const selectedId = opts.selectedAgentId
     ? String(opts.selectedAgentId)
     : null;
+  const lastSeen = opts.lastSeenByAgent && typeof opts.lastSeenByAgent === "object"
+    ? opts.lastSeenByAgent
+    : {};
 
   /** @type {Map<string, number>} agentId → latest finishedAt ms */
   const latestFinished = new Map();
@@ -221,7 +224,10 @@ export function activityBadgeCount(jobs, agents, opts = {}) {
     // User is already in this chat — no badge nag
     if (selectedId && a.id === selectedId) continue;
     if (!agentIsReadyForUser(a)) continue;
-    if (!latestFinished.has(a.id)) continue;
+    const finished = latestFinished.get(a.id);
+    if (!finished) continue;
+    const seenAt = Number(lastSeen[a.id] || 0);
+    if (finished <= seenAt) continue;
     count++;
   }
   return count;

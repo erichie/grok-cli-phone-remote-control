@@ -1,8 +1,8 @@
-const CACHE = "grok-phone-v61";
+const CACHE = "grok-phone-v62";
 const ASSETS = [
   "/",
   "/index.html",
-  "/app.js?v=61",
+  "/app.js?v=62",
   "/app.js",
   "/history-merge.mjs",
   "/thinking-ui.mjs",
@@ -10,7 +10,7 @@ const ASSETS = [
   "/voice-ui.mjs",
   "/standup-ui.mjs",
   "/loops-ui.mjs",
-  "/styles.css?v=61",
+  "/styles.css?v=62",
   "/styles.css",
   "/marked.min.js",
   "/purify.min.js",

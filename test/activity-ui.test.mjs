@@ -179,6 +179,31 @@ test("activityBadgeCount only counts idle agents with a recent finished turn", (
     0
   );
   assert.equal(activityBadgeCount([], readyAgents, { now }), 0);
+  // Already-read Main turn must not nag after you switch away
+  const mainDone = [
+    {
+      id: "m1",
+      status: "done",
+      agentId: "main",
+      finishedAt: "2026-08-09T14:50:00.000Z",
+    },
+  ];
+  assert.equal(
+    activityBadgeCount(mainDone, readyAgents, {
+      now,
+      selectedAgentId: "aaaa-bbbb",
+      lastSeenByAgent: { main: Date.parse("2026-08-09T14:51:00.000Z") },
+    }),
+    0
+  );
+  assert.equal(
+    activityBadgeCount(mainDone, readyAgents, {
+      now,
+      selectedAgentId: "aaaa-bbbb",
+      lastSeenByAgent: { main: Date.parse("2026-08-09T14:40:00.000Z") },
+    }),
+    1
+  );
 });
 
 test("chatAgentIdPayload normalizes default", () => {
