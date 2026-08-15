@@ -15,7 +15,7 @@ Authoritative user docs: repo root `README.md`. Prefer this skill when **doing**
 
 ## What this product is
 
-- Installable phone PWA that drives a **local** Grok agent via ACP (`grok agent --always-approve stdio`).
+- Installable phone PWA that drives a **local** Grok agent via ACP (`grok agent --always-approve --effort medium stdio`).
 - **Not** a mirror of an open TUI session — its own process(es) on the Mac.
 - Personal LAN / **Tailscale** bridge only — never a public multi-tenant service.
 

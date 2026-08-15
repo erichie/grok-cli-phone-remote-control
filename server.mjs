@@ -1,5 +1,5 @@
 /**
- * Phone PWA bridge → local `grok agent --always-approve stdio` (ACP).
+ * Phone PWA bridge → local `grok agent --always-approve --effort medium stdio` (ACP).
  *
  * Env:
  *   PHONE_CHAT_SECRET   required shared secret (Authorization: Bearer …)
@@ -110,6 +110,8 @@ const CWD =
   process.env.GROK_PHONE_CWD ||
   join(__dirname, ".."); // default: parent of this app (set PHONE_CHAT_CWD to override)
 const GROK_BIN = process.env.GROK_BIN || "grok";
+/** Phone ACP + headless fallback always start at medium (not high). */
+const AGENT_REASONING_EFFORT = "medium";
 const INBOX = join(homedir(), ".grok", "phone-inbox");
 const JOBS_DIR = join(homedir(), ".grok", "phone-jobs");
 /** Durable conversation transcript + last ACP session id (survives bridge restart). */
@@ -491,7 +493,13 @@ class GrokAcp {
     this.sessionResumed = false;
     this.proc = spawn(
       GROK_BIN,
-      ["agent", "--always-approve", "stdio"],
+      [
+        "agent",
+        "--always-approve",
+        "--effort",
+        AGENT_REASONING_EFFORT,
+        "stdio",
+      ],
       {
         cwd: this.cwd,
         stdio: ["pipe", "pipe", "pipe"],
@@ -1346,6 +1354,8 @@ function runHeadlessPrompt(promptText, cwd, timeoutMs = 8 * 60 * 1000) {
   return new Promise((resolve, reject) => {
     const args = [
       "--always-approve",
+      "--effort",
+      AGENT_REASONING_EFFORT,
       "--cwd",
       cwd,
       "-p",
@@ -3199,6 +3209,7 @@ function expandSlashForAgent(text) {
     "/context",
     "/compact",
     "/always-approve",
+    "/effort",
     "/deep-research",
     "/workflow",
     "/goal",

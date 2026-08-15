@@ -15,8 +15,10 @@ Setup detail: **[Live mic: free local HTTPS](#live-mic-free-local-https)** below
 This is **not** a mirror of an open TUI session. It starts its own ACP process:
 
 ```text
-grok agent --always-approve stdio
+grok agent --always-approve --effort medium stdio
 ```
+
+New ACP processes and the headless fallback start at **medium** reasoning effort so phone turns do not default to high. You can still send `/effort high` (or another level) later in that chat.
 
 ---
 

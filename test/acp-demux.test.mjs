@@ -227,4 +227,8 @@ test("server.mjs wires GrokAcp through AcpLineHandler / classify demux", () => {
   // Process-group kill for concurrent agents
   assert.match(src, /killProcessTree/);
   assert.match(src, /createAgentRegistry/);
+  // Phone agents start at medium reasoning effort
+  assert.match(src, /AGENT_REASONING_EFFORT\s*=\s*"medium"/);
+  assert.match(src, /--effort[\s\S]*AGENT_REASONING_EFFORT[\s\S]*stdio/);
+  assert.match(src, /--effort[\s\S]*AGENT_REASONING_EFFORT[\s\S]*--cwd/);
 });
