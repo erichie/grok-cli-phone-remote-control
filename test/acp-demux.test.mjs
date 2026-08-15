@@ -231,4 +231,8 @@ test("server.mjs wires GrokAcp through AcpLineHandler / classify demux", () => {
   assert.match(src, /AGENT_REASONING_EFFORT\s*=\s*"medium"/);
   assert.match(src, /--effort[\s\S]*AGENT_REASONING_EFFORT[\s\S]*stdio/);
   assert.match(src, /--effort[\s\S]*AGENT_REASONING_EFFORT[\s\S]*--cwd/);
+  // Extra agents resume from a host-only roster after bounce
+  assert.match(src, /phone-agents\.json/);
+  assert.match(src, /loadAgentRoster/);
+  assert.match(src, /registry\.restore/);
 });

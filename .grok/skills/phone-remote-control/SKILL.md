@@ -119,9 +119,9 @@ cp examples/phone-loops.example.json ~/.grok/phone-loops.json
 
 **Loops run on the Mac** (`grok -p`, not the main chat) while the bridge is up. Due window is ~90s — no afternoon catch-up. A synth prompt includes today’s briefs or `NO REPORT TODAY`; it must not invent missing numbers.
 
-Host-only (gitignore / do not add): `phone-standup.db` or `.json`, `phone-standup-seed.json`, `phone-loops.json`, `phone-loops-state.json`, `phone-briefs.json`.
+Host-only (gitignore / do not add): `phone-standup.db` or `.json`, `phone-standup-seed.json`, `phone-loops.json`, `phone-loops-state.json`, `phone-briefs.json`, `phone-agents.json`.
 
-Extra-agent chats stay on that agent. Do not rebuild the main conversation from every `phone-jobs` file.
+Extra-agent chats stay on that agent. Do not rebuild the main conversation from every `phone-jobs` file. Extra agents persist in `~/.grok/phone-agents.json` and resume on LaunchAgent restart (same id + ACP session). Closing an extra agent removes it from that file.
 
 ## Security rules (always)
 

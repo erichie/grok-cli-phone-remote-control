@@ -20,6 +20,8 @@ grok agent --always-approve --effort medium stdio
 
 New ACP processes and the headless fallback start at **medium** reasoning effort so phone turns do not default to high. You can still send `/effort high` (or another level) later in that chat.
 
+**Bridge restart:** Main reloads `~/.grok/phone-conversation.json`. Extra agents (Budgey, etc.) reload from `~/.grok/phone-agents.json` with the same id, name, and ACP session so the phone chats come back. Closing an agent on the Mac drops it from that file.
+
 ---
 
 ## Prerequisites
@@ -316,6 +318,7 @@ Schedule object on each loop:
 | `~/.grok/phone-loops.json` | Loop catalog (copy from `examples/phone-loops.example.json`) |
 | `~/.grok/phone-loops-state.json` | Last-run stamps |
 | `~/.grok/phone-briefs.json` | Latest specialist brief per loop |
+| `~/.grok/phone-agents.json` | Extra-agent roster + ACP session ids (resume after bounce) |
 
 The committed example (`examples/phone-loops.example.json`) is generic on purpose: morning brief, ads health, inbox watch. Put real loop names and goals only under `~/.grok/`.
 
@@ -384,6 +387,7 @@ This project is open source. **Before every commit and push to GitHub**, confirm
 | Personal identity | Personal email addresses, filled-in LaunchAgent plists, machine labels |
 | Runtime data | `~/.grok/phone-jobs`, inbox images, logs, `.env` with real values |
 | Standup / loops | `~/.grok/phone-standup.db`, `phone-standup.json`, `phone-standup-seed.json`, `phone-loops.json`, `phone-loops-state.json`, `phone-briefs.json` — personal goals, briefs, last-run stamps |
+| Extra agents | `~/.grok/phone-agents.json` — names and session ids for concurrent chats |
 
 **Required check (also runs in `npm test` via `test/no-local-leaks.test.mjs`):**
 

@@ -12,6 +12,7 @@ function fakeAcp(cwd) {
   const state = {
     cwd,
     sessionId: null,
+    preferredSessionId: null,
     proc: null,
     terminals: { terminals: new Map() },
     stopCount: 0,
@@ -25,6 +26,12 @@ function fakeAcp(cwd) {
     },
     set sessionId(v) {
       state.sessionId = v;
+    },
+    get preferredSessionId() {
+      return state.preferredSessionId;
+    },
+    set preferredSessionId(v) {
+      state.preferredSessionId = v;
     },
     get proc() {
       return state.proc;
@@ -69,6 +76,31 @@ test("registry starts with main slot only", () => {
   assert.equal(reg.get("main"), reg.main);
   assert.equal(reg.get("default"), reg.main);
   assert.equal(reg.get(null), reg.main);
+});
+
+test("restore recreates extras with the same id and session", () => {
+  const reg = createAgentRegistry({
+    createAcp: (cwd) => fakeAcp(cwd),
+    defaultCwd: "/work",
+    maxAgents: 4,
+  });
+  const restored = reg.restore([
+    {
+      id: "5e707bec-515d-45b8-a5fb-0d1502ae9824",
+      label: "Budgey",
+      cwd: "/work",
+      sessionId: "sess-budgey-1",
+    },
+    { id: "main", label: "ignored" },
+  ]);
+  assert.equal(restored.length, 1);
+  assert.equal(restored[0].id, "5e707bec-515d-45b8-a5fb-0d1502ae9824");
+  assert.equal(restored[0].label, "Budgey");
+  const slot = reg.get("5e707bec-515d-45b8-a5fb-0d1502ae9824");
+  assert.equal(slot.acp.preferredSessionId, "sess-budgey-1");
+  const snap = reg.snapshotExtras();
+  assert.equal(snap.length, 1);
+  assert.equal(snap[0].sessionId, "sess-budgey-1");
 });
 
 test("create adds concurrent agents up to maxAgents", () => {

@@ -85,6 +85,7 @@ import {
   isLoopDue,
 } from "./lib/loops.mjs";
 import { readAllBriefs, readBrief, upsertBrief } from "./lib/briefs.mjs";
+import { loadAgentRoster, saveAgentRoster } from "./lib/agents-store.mjs";
 import {
   parseLoopReport,
   gatherSynthInputs,
@@ -125,6 +126,8 @@ const LOOPS_PATH = join(homedir(), ".grok", "phone-loops.json");
 const LOOPS_STATE_PATH = join(homedir(), ".grok", "phone-loops-state.json");
 /** Latest specialist brief per loop. Host-only. */
 const BRIEFS_PATH = join(homedir(), ".grok", "phone-briefs.json");
+/** Extra-agent roster + ACP session ids so a bounce restores Budgey etc. */
+const AGENTS_PATH = join(homedir(), ".grok", "phone-agents.json");
 const AUTH_PATH = join(homedir(), ".grok", "auth.json");
 /** Live credit/usage (same source as TUI /usage). */
 const BILLING_CREDITS_URL =
@@ -700,10 +703,21 @@ async function persistConversation() {
   }
 }
 
+async function persistAgentRoster() {
+  try {
+    await saveAgentRoster(AGENTS_PATH, registry.snapshotExtras());
+  } catch (e) {
+    console.warn("[agents] save roster failed", e.message);
+  }
+}
+
 async function rememberJobInConversation(job) {
   if (!job?.id) return;
   // Extra agents must not land in the main host transcript (phone main chat).
-  if (!jobBelongsToMainConversation(job)) return;
+  if (!jobBelongsToMainConversation(job)) {
+    if (isTerminalJobStatus(job.status)) await persistAgentRoster();
+    return;
+  }
   upsertJobInConversation(conversation, job);
   // Durable transcript is shared; ACP session resume only applies to main.
   // Extra concurrent agents keep their own process-local sessionIds.
@@ -720,7 +734,7 @@ async function rememberJobInConversation(job) {
   await persistConversation();
 }
 
-// warm start: durable conversation + recover jobs + resume ACP session
+// warm start: durable conversation + extra-agent roster + recover jobs + resume ACP
 (async () => {
   try {
     conversation = await loadConversation(CONVERSATION_PATH);
@@ -736,6 +750,22 @@ async function rememberJobInConversation(job) {
     console.warn("[conversation] bootstrap failed", e.message);
   }
   try {
+    const saved = await loadAgentRoster(AGENTS_PATH);
+    const restored = registry.restore(
+      saved.map((rec) => ({
+        ...rec,
+        cwd: rec.cwd && existsSync(rec.cwd) ? rec.cwd : CWD,
+      }))
+    );
+    if (restored.length) {
+      console.log(
+        `[agents] restored ${restored.length}: ${restored.map((a) => a.label).join(", ")}`
+      );
+    }
+  } catch (e) {
+    console.warn("[agents] restore failed", e.message);
+  }
+  try {
     await recoverJobsOnStartup();
   } catch (e) {
     console.error("[jobs] recovery failed:", e.message);
@@ -748,6 +778,17 @@ async function rememberJobInConversation(job) {
     }
   } catch (e) {
     console.error("[agent] start failed:", e.message);
+  }
+  for (const pub of registry.list()) {
+    if (pub.isMain) continue;
+    const slot = registry.get(pub.id);
+    if (!slot?.acp) continue;
+    void slot.acp
+      .start()
+      .then(() => persistAgentRoster())
+      .catch((e) =>
+        console.warn("[agents] resume start failed", pub.id, e.message)
+      );
   }
 })();
 // every 15s: unstick jobs that claim running but aren't being processed
@@ -889,15 +930,13 @@ async function recoverJobsOnStartup() {
       await persistJob(job);
       interrupted++;
     } else if (job.status === "queued") {
-      // Extra agents do not survive restart — fold onto main queue
-      if (job.agentId && job.agentId !== "main") {
-        job.agentId = "main";
+      const want = String(job.agentId || "main").trim() || "main";
+      const slot = registry.get(want) || registry.main;
+      if (slot.id !== want) {
+        job.agentId = slot.id;
         job.updatedAt = new Date().toISOString();
         await persistJob(job);
-      } else {
-        job.agentId = "main";
       }
-      const slot = slotFor("main");
       if (!slot.jobQueue.includes(job.id)) {
         slot.jobQueue.push(job.id);
         requeued++;
@@ -909,7 +948,11 @@ async function recoverJobsOnStartup() {
       `[jobs] startup recovery: interrupted=${interrupted} requeued=${requeued}`
     );
   }
-  if (requeued) void processQueue("main");
+  if (requeued) {
+    for (const pub of registry.list()) {
+      if (pub.queueLength) void processQueue(pub.id);
+    }
+  }
 }
 
 /**
@@ -2219,6 +2262,7 @@ async function resetAll() {
   } catch (e) {
     console.warn("[reset] stopAllExtras", e.message);
   }
+  await persistAgentRoster();
   conversation = startFreshConversation(conversation);
   await agent.reset({ fresh: true });
   conversation.acpSessionId = agent.sessionId || null;
@@ -2507,6 +2551,7 @@ async function stopAgentHard(agentId, opts = {}) {
   const out = await registry.stop(slot.id, {
     remove: !!opts.remove && !slot.isMain,
   });
+  await persistAgentRoster();
   return out;
 }
 
@@ -2806,12 +2851,15 @@ async function handleAgentCreate(req, res) {
       label: body.label,
       cwd: body.cwd,
     });
+    await persistAgentRoster();
     // Warm-start ACP process so Activity shows alive quickly
     const slot = registry.get(created.id);
     if (slot?.acp) {
-      void slot.acp.start().catch((e) =>
-        console.warn("[agents] start failed", created.id, e.message)
-      );
+      void slot.acp.start()
+        .then(() => persistAgentRoster())
+        .catch((e) =>
+          console.warn("[agents] start failed", created.id, e.message)
+        );
     }
     sendJson(res, 201, { agent: created, agents: registry.list() });
   } catch (e) {
@@ -2848,6 +2896,7 @@ async function handleAgentRename(req, res, id) {
   }
   try {
     const agent = registry.rename(id, body.label);
+    await persistAgentRoster();
     sendJson(res, 200, { agent, agents: registry.list() });
   } catch (e) {
     const code =
